@@ -1,0 +1,268 @@
+ggml-webgpu: Q4_0 x F32 matrix multiplication that keeps its values in registers
+
+Applies to: whisper.cpp 482279b8a18855ba741d7b88c30fcb3874691f59 (ggml synced at ggml-org/ggml facdc44a),
+            ggml/src/ggml-webgpu. Applied by native/build-wasm.sh to a copy of the sources, for the webgpu variant
+            only; the CPU modules (mt, st) and the submodule are not touched.
+Origin:     written for CzechSpeech (Moravian AI), same licence as ggml (MIT). Not a backport: upstream ggml-webgpu
+            (llama.cpp master and ggml master up to 2026-11-05, e.g. llama.cpp 553d2c2, b393d73, 713319e, 1c5ed70;
+            ggml cb27aa1) has no change to the quantised mat-mat path since this pin; its newer work is new ops and CI
+            fixes, and its faster quantised paths (MMVQ, #23594/#29483) are mat-vec only.
+
+What and why
+  Whisper's encoder spends most of its time in Q4_0 x F32 matrix multiplications with N = the number of audio
+  frames (a few hundred). ggml-webgpu runs them with the generic mul_mat_reg_tile kernel. On an Intel Arc iGPU
+  (Xe-LPG, Chromium 156, D3D12) that kernel reached about 120 GFLOPS: 4.0 s of the 4.7 s GPU time of a 6.9 s
+  utterance. Its per-thread accumulators and dequantised values are private arrays indexed by loop counters,
+  which the shader compiler can keep in scratch memory instead of registers; it also stages shared memory as
+  scalar f16 rows TILE_K apart, so neighbouring threads hit the same bank.
+
+  This patch adds wgsl-shaders/mul_mat_q4_0_tile.wgsl and uses it from get_mul_mat_fast_pipeline() for
+  Q4_0 x F32 -> F32 when neither the subgroup-matrix path nor overlapping sources apply (the dispatch, parameters
+  and bindings of the reg-tile path are reused unchanged; N <= 4 still goes to the mat-vec kernels):
+    - every per-thread value is a named vec4 variable (4 rows x 4 columns per thread, 256 threads, 64 x 64 tile);
+    - the weight tile is stored k-major and the activation tile n-major with a padded row, read as whole
+      vec4<f16>: neighbouring threads read neighbouring vec4s or the same one;
+    - every shared-memory write is a whole vec4<f16>.
+  The arithmetic is that of the reg-tile path: weights dequantised to f16 as dequant_q4_0_packed_to_shmem does,
+  activations rounded to f16, f32 accumulation with k ascending. Requirements: shader-f16, which ggml-webgpu
+  requires for every device anyway; no subgroups. Every other type and case keeps the existing kernels.
+
+  Measured (same laptop, e-rec 6.9 s, warm): the Q4_0 mat-mat 3.99 s -> 0.47 s of GPU time, the encoder
+  4.5 s -> 1.1 s; transcripts unchanged (see the CzechSpeech README).
+
+diff -ruN a/ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp b/ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
+--- a/ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu-shader-lib.hpp
+@@ -2171,7 +2171,42 @@
+         return mul_mat_vec_pipelines[key];
+     }
+ 
++    // CzechSpeech patch: Q4_0 x F32 mat-mat that keeps every per-thread value in registers and reads shared memory as
++    // whole vec4<f16> without bank conflicts (mul_mat_q4_0_tile.wgsl). Same parameters, bindings and dispatch
++    // geometry fields as the reg-tile path (each thread computes 4 x 4 outputs); needs only shader-f16.
++    static constexpr uint32_t Q4T_WGM = 16;  // threads along m (4 rows each)
++    static constexpr uint32_t Q4T_WGN = 16;  // threads along n (4 columns each)
++    webgpu_pipeline           mul_mat_q4_0_tile_pipeline;
++
++    webgpu_pipeline get_mul_mat_q4_0_tile_pipeline() {
++        if (mul_mat_q4_0_tile_pipeline.pipeline) {
++            return mul_mat_q4_0_tile_pipeline;
++        }
++        std::vector<std::string> defines = {
++            "Q4T_WGM=" + std::to_string(Q4T_WGM) + "u",
++            "Q4T_WGN=" + std::to_string(Q4T_WGN) + "u",
++        };
++        auto processed                 = preprocessor.preprocess(wgsl_mul_mat_q4_0_tile, defines);
++        auto decisions                 = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
++        decisions->tile_k              = 32;
++        decisions->tile_m              = 4;
++        decisions->tile_n              = 4;
++        decisions->wg_size_m           = Q4T_WGM;
++        decisions->wg_size_n           = Q4T_WGN;
++        decisions->wg_size             = Q4T_WGM * Q4T_WGN;
++        decisions->mul_mat_wg_size     = Q4T_WGM * Q4T_WGN;
++        decisions->use_subgroup_matrix = 0;
++        webgpu_pipeline pipeline       = ggml_webgpu_create_pipeline(device, processed, "mul_mat_q4_0_tile");
++        pipeline.context               = decisions;
++        mul_mat_q4_0_tile_pipeline     = pipeline;
++        return mul_mat_q4_0_tile_pipeline;
++    }
++
+     webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
++        if (context.src0->type == GGML_TYPE_Q4_0 && context.src1->type == GGML_TYPE_F32 &&
++            context.dst->type == GGML_TYPE_F32 && !context.supports_subgroup_matrix && !src_overlap) {
++            return get_mul_mat_q4_0_tile_pipeline();
++        }
+         ggml_webgpu_mul_mat_pipeline_key key = {};
+         key.src0_type                        = context.src0->type;
+         key.src1_type                        = context.src1->type;
+diff -ruN a/ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_q4_0_tile.wgsl b/ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_q4_0_tile.wgsl
+--- a/ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_q4_0_tile.wgsl
++++ b/ggml/src/ggml-webgpu/wgsl-shaders/mul_mat_q4_0_tile.wgsl
+@@ -0,0 +1,186 @@
++// Q4_0 x F32 -> F32 matrix multiplication for N > 4 (CzechSpeech patch: native/patches/ in czechspeech-web).
++//
++// Same arithmetic as mul_mat_reg_tile for Q4_0 (weights dequantised to f16 as in dequant_q4_0_packed_to_shmem,
++// activations rounded to f16, products accumulated in f32 with k ascending), different data movement:
++//   - every per-thread value lives in a named vector variable: no private array indexed by a loop counter, which a
++//     shader compiler may place in scratch memory instead of registers;
++//   - the weight tile is stored k-major ([k][m/4], vec4<f16> along m) and the activation tile n-major with a padded
++//     row ([n][k/4 + 1], vec4<f16> along k): the inner loop reads whole vec4<f16>, neighbouring threads read
++//     neighbouring vec4s (no bank conflicts) or the same one (broadcast);
++//   - every shared-memory write is a whole vec4<f16> (four rows of one weight column, four k of one activation
++//     column), so no two threads write parts of the same 32-bit word.
++// A workgroup of Q4T_WGM x Q4T_WGN threads computes a (4*Q4T_WGM) x (4*Q4T_WGN) output tile; each thread four
++// consecutive rows (m) of four columns (n). Needs shader-f16, as every ggml-webgpu device does; no subgroups.
++// Parameters and bindings are those of mul_mat_reg_tile.
++
++enable f16;
++
++struct MulMatParams {
++    offset_src0: u32,
++    offset_src1: u32,
++    offset_dst: u32,
++    m: u32,
++    n: u32,
++    k: u32,
++    stride_01: u32,
++    stride_11: u32,
++    stride_02: u32,
++    stride_12: u32,
++    stride_03: u32,
++    stride_13: u32,
++    bs02: u32,
++    bs03: u32,
++    broadcast2: u32,
++    broadcast3: u32
++};
++
++@group(0) @binding(0) var<storage, read_write> src0: array<u32>; // Q4_0 blocks (18 bytes), M rows of K/32 blocks
++@group(0) @binding(1) var<storage, read_write> src1: array<f32>; // N columns of K values
++@group(0) @binding(2) var<storage, read_write> dst: array<f32>;  // N columns of M values
++@group(0) @binding(3) var<uniform> params: MulMatParams;
++
++const WGM: u32 = Q4T_WGM;          // threads along m; each owns 4 rows
++const WGN: u32 = Q4T_WGN;          // threads along n; each owns 4 columns
++const NT: u32 = WGM * WGN;
++const BM: u32 = WGM * 4u;
++const BN: u32 = WGN * 4u;
++const BK: u32 = 32u;               // one Q4_0 block per row and step
++const BKP4: u32 = BK / 4u + 1u;    // vec4<f16> per padded activation row
++
++var<workgroup> As: array<vec4<f16>, BK * WGM>;   // [k][m/4]
++var<workgroup> Bs: array<vec4<f16>, BN * BKP4>;  // [n][k/4], padded
++
++fn load_u32_src0(byte_offset: u32) -> u32 {
++    let w = byte_offset >> 2u;
++    let shift = (byte_offset & 3u) * 8u;
++    let lo = src0[w];
++    if (shift == 0u) {
++        return lo;
++    }
++    return (lo >> shift) | (src0[w + 1u] << (32u - shift));
++}
++
++fn load_f16_src0(byte_offset: u32) -> f16 {
++    let word = src0[byte_offset >> 2u];
++    let shift = (byte_offset & 2u) * 8u;
++    return f16(unpack2x16float((word >> shift) & 0xFFFFu)[0]);
++}
++
++// the 4-bit values at bit `shift` of four rows' quant words, dequantised with the rows' scales
++fn nib4(q: vec4<u32>, shift: u32, d: vec4<f16>) -> vec4<f16> {
++    return (vec4<f16>((q >> vec4<u32>(shift)) & vec4<u32>(0xFu)) - vec4<f16>(8.0)) * d;
++}
++
++fn store4(base: u32, m0: u32, v: vec4<f32>) {
++    if (m0 < params.m) { dst[base + m0] = v.x; }
++    if (m0 + 1u < params.m) { dst[base + m0 + 1u] = v.y; }
++    if (m0 + 2u < params.m) { dst[base + m0 + 2u] = v.z; }
++    if (m0 + 3u < params.m) { dst[base + m0 + 3u] = v.w; }
++}
++
++@compute @workgroup_size(NT)
++fn main(@builtin(workgroup_id) wg_id: vec3<u32>,
++        @builtin(local_invocation_id) local_id: vec3<u32>,
++        @builtin(num_workgroups) num_wg: vec3<u32>) {
++
++    let tid = local_id.x;
++    let local_m = tid % WGM;
++    let local_n = tid / WGM;
++
++    let wg_m_count = (params.m + BM - 1u) / BM;
++    let wg_n_count = (params.n + BN - 1u) / BN;
++    let wg_per_matrix = wg_m_count * wg_n_count;
++    let wg_linear = wg_id.y * num_wg.x + wg_id.x;
++    let batch_idx = wg_linear / wg_per_matrix;
++    let total_batches = params.bs02 * params.broadcast2 * params.bs03 * params.broadcast3;
++    if (batch_idx >= total_batches) {
++        return;
++    }
++    let wg_in_batch = wg_linear % wg_per_matrix;
++    let offset_m = (wg_in_batch % wg_m_count) * BM;
++    let offset_n = (wg_in_batch / wg_m_count) * BN;
++
++    let dst2_stride = params.m * params.n;
++    let dst3_stride = dst2_stride * params.bs02 * params.broadcast2;
++    let dst3_idx = batch_idx / (params.bs02 * params.broadcast2);
++    let src03_idx = dst3_idx / params.broadcast3;
++    let src13_idx = dst3_idx;
++    let dst2_idx = batch_idx % (params.bs02 * params.broadcast2);
++    let src02_idx = dst2_idx / params.broadcast2;
++    let src12_idx = dst2_idx;
++    let src0_batch = params.offset_src0 + src03_idx * params.stride_03 + src02_idx * params.stride_02; // in blocks
++    let src1_batch = params.offset_src1 + src13_idx * params.stride_13 + src12_idx * params.stride_12;
++
++    var acc0 = vec4<f32>(0.0);
++    var acc1 = vec4<f32>(0.0);
++    var acc2 = vec4<f32>(0.0);
++    var acc3 = vec4<f32>(0.0);
++    let a_col = local_m;                 // As[k * WGM + a_col]
++    let b_row = local_n * 4u * BKP4;     // Bs[b_row + j * BKP4 + k / 4]
++    let n_blocks = params.k / BK;
++
++    for (var kb = 0u; kb < n_blocks; kb++) {
++        // Weights: job = (4-row group g, part p). Part p is quant bytes 4p..4p+3: k = 4p..4p+3 in the low nibbles and
++        // k = 16+4p..16+4p+3 in the high nibbles.
++        for (var job = tid; job < 4u * WGM; job += NT) {
++            let g = job / 4u;
++            let p = job % 4u;
++            let m = offset_m + g * 4u;
++            var q = vec4<u32>(0x88888888u); // dequantises to 0 for rows past the end
++            var d = vec4<f16>(0.0);
++            let row0 = (src0_batch + m * params.stride_01 + kb) * 18u;
++            let rs = params.stride_01 * 18u;
++            if (m < params.m) { d.x = load_f16_src0(row0); q.x = load_u32_src0(row0 + 2u + 4u * p); }
++            if (m + 1u < params.m) { d.y = load_f16_src0(row0 + rs); q.y = load_u32_src0(row0 + rs + 2u + 4u * p); }
++            if (m + 2u < params.m) { d.z = load_f16_src0(row0 + 2u * rs); q.z = load_u32_src0(row0 + 2u * rs + 2u + 4u * p); }
++            if (m + 3u < params.m) { d.w = load_f16_src0(row0 + 3u * rs); q.w = load_u32_src0(row0 + 3u * rs + 2u + 4u * p); }
++            let k0 = 4u * p;
++            As[(k0 + 0u) * WGM + g] = nib4(q, 0u, d);
++            As[(k0 + 1u) * WGM + g] = nib4(q, 8u, d);
++            As[(k0 + 2u) * WGM + g] = nib4(q, 16u, d);
++            As[(k0 + 3u) * WGM + g] = nib4(q, 24u, d);
++            As[(k0 + 16u) * WGM + g] = nib4(q, 4u, d);
++            As[(k0 + 17u) * WGM + g] = nib4(q, 12u, d);
++            As[(k0 + 18u) * WGM + g] = nib4(q, 20u, d);
++            As[(k0 + 19u) * WGM + g] = nib4(q, 28u, d);
++        }
++        // Activations: job = (column c, 4 consecutive k)
++        for (var job = tid; job < BN * (BK / 4u); job += NT) {
++            let c = job / (BK / 4u);
++            let k4 = job % (BK / 4u);
++            let n = offset_n + c;
++            var v = vec4<f16>(0.0);
++            if (n < params.n) {
++                let i = src1_batch + n * params.stride_11 + kb * BK + k4 * 4u;
++                v = vec4<f16>(vec4<f32>(src1[i], src1[i + 1u], src1[i + 2u], src1[i + 3u]));
++            }
++            Bs[c * BKP4 + k4] = v;
++        }
++        workgroupBarrier();
++
++        for (var k4 = 0u; k4 < BK / 4u; k4++) {
++            let b0 = vec4<f32>(Bs[b_row + k4]);
++            let b1 = vec4<f32>(Bs[b_row + BKP4 + k4]);
++            let b2 = vec4<f32>(Bs[b_row + 2u * BKP4 + k4]);
++            let b3 = vec4<f32>(Bs[b_row + 3u * BKP4 + k4]);
++            let ab = k4 * 4u * WGM + a_col;
++            let a0 = vec4<f32>(As[ab]);
++            acc0 += a0 * b0.x; acc1 += a0 * b1.x; acc2 += a0 * b2.x; acc3 += a0 * b3.x;
++            let a1 = vec4<f32>(As[ab + WGM]);
++            acc0 += a1 * b0.y; acc1 += a1 * b1.y; acc2 += a1 * b2.y; acc3 += a1 * b3.y;
++            let a2 = vec4<f32>(As[ab + 2u * WGM]);
++            acc0 += a2 * b0.z; acc1 += a2 * b1.z; acc2 += a2 * b2.z; acc3 += a2 * b3.z;
++            let a3 = vec4<f32>(As[ab + 3u * WGM]);
++            acc0 += a3 * b0.w; acc1 += a3 * b1.w; acc2 += a3 * b2.w; acc3 += a3 * b3.w;
++        }
++        workgroupBarrier();
++    }
++
++    let dst_batch = params.offset_dst + dst3_idx * dst3_stride + dst2_idx * dst2_stride;
++    let m0 = offset_m + local_m * 4u;
++    let n0 = offset_n + local_n * 4u;
++    if (n0 < params.n) { store4(dst_batch + n0 * params.m, m0, acc0); }
++    if (n0 + 1u < params.n) { store4(dst_batch + (n0 + 1u) * params.m, m0, acc1); }
++    if (n0 + 2u < params.n) { store4(dst_batch + (n0 + 2u) * params.m, m0, acc2); }
++    if (n0 + 3u < params.n) { store4(dst_batch + (n0 + 3u) * params.m, m0, acc3); }
++}

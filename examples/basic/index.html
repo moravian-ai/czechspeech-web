@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CzechSpeech: example</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; color: #1b1b1f; }
+    h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
+    h2 { font-size: 1.1rem; margin-top: 1.8rem; }
+    .muted { color: #5c5c66; font-size: 0.9rem; }
+    .warn { color: #8a4b00; }
+    button { font: inherit; padding: 0.4rem 1rem; margin-right: 0.4rem; cursor: pointer; }
+    button:disabled { cursor: default; opacity: 0.5; }
+    progress { width: 16rem; vertical-align: middle; }
+    #indicator { margin-left: 0.6rem; font-weight: 600; }
+    #transcripts { padding-left: 1.4rem; }
+    #transcripts li { margin: 0.4rem 0; }
+    #transcripts li small { color: #5c5c66; margin-left: 0.4rem; }
+    #transcripts li.error { color: #a00; }
+  </style>
+</head>
+<body>
+  <h1>CzechSpeech</h1>
+  <p class="muted">Czech speech-to-text that runs in this page. Audio never leaves your browser.</p>
+  <p id="env" class="muted"></p>
+
+  <h2>1. Model</h2>
+  <p>
+    <button id="download">Download the model (474 MB)</button>
+    <button id="delete" disabled>Delete it</button>
+  </p>
+  <p><progress id="progress" max="1" value="0" hidden></progress> <span id="model-status" class="muted"></span></p>
+
+  <h2>2. Dictate</h2>
+  <p>
+    <button id="start" disabled>Start</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="indicator"></span>
+  </p>
+  <ol id="transcripts"></ol>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

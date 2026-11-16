@@ -1,0 +1,31 @@
+CzechSpeech: class
+    static create()
+    close()
+    config { get }
+    listen()
+    state { get }
+    stop()
+    transcribe()
+    transcripts()
+CzechSpeechError: class
+CzechSpeechModel: class
+    static DEFAULT { get }
+    static _fromPath()
+    static delete()
+    static download()
+    static fromBytes()
+    static fromUrl()
+    static isDownloaded()
+    _workerSource()
+DEFAULT_AUDIO_CONSTRAINTS: object { autoGainControl, channelCount, echoCancellation, noiseSuppression }
+DEFAULT_CONFIG: object { backend, maxUtteranceMs, minSilenceMs, minSpeechMs, negThreshold, preRollMs, threads, threshold }
+DEFAULT_MODEL: object { sha256, size, url }
+DEFAULT_MODEL_ID: string "cs"
+MODELS: object { cs }
+SpeechEndedEvent: class
+SpeechErrorEvent: class
+SpeechStartedEvent: class
+TranscriptEvent: class
+    toJSON()
+    toString()
+VERSION: string

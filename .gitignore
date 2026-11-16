@@ -1,0 +1,21 @@
+node_modules/
+# build output of native/build-wasm.sh (rebuild it; the npm package includes src/wasm/)
+src/wasm/
+build/
+*.tgz
+test-results/
+
+# Never commit models or audio. The CzechSpeech model is downloaded at runtime (CzechSpeechModel.download);
+# test audio stays outside the repository. The only bundled model is the Silero VAD asset, whitelisted below.
+*.bin
+!src/assets/ggml-silero-v6.2.0.bin
+*.gguf
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.opus
+*.webm
+*.pcm
+*.part

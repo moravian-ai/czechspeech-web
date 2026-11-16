@@ -1,0 +1,105 @@
+{
+  "name": "@moravianai/czechspeech",
+  "version": "0.2.0",
+  "description": "Offline Czech speech-to-text for web apps: CzechSpeech (Whisper large-v3-turbo fine-tuned on Czech) on whisper.cpp in WebAssembly, on the GPU through WebGPU where available, with Silero VAD. Audio never leaves the page.",
+  "type": "module",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/index.js",
+    "src/backend.js",
+    "src/catalog.js",
+    "src/config.js",
+    "src/decoding.js",
+    "src/endpointer.js",
+    "src/engine-wasm.js",
+    "src/events.js",
+    "src/mic.js",
+    "src/model.js",
+    "src/repetition.js",
+    "src/resampler.js",
+    "src/sha256.js",
+    "src/speech.js",
+    "src/worker.js",
+    "src/worker-core.js",
+    "src/worklet.js",
+    "src/wasm/czechspeech-mt.js",
+    "src/wasm/czechspeech-mt.wasm",
+    "src/wasm/czechspeech-st.js",
+    "src/wasm/czechspeech-st.wasm",
+    "src/wasm/czechspeech-webgpu.js",
+    "src/wasm/czechspeech-webgpu.wasm",
+    "src/assets/ggml-silero-v6.2.0.bin",
+    "types/index.d.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "sideEffects": [
+    "./src/worker.js",
+    "./src/worklet.js"
+  ],
+  "scripts": {
+    "build:wasm": "bash native/build-wasm.sh",
+    "build:worklet": "node scripts/build-worklet.mjs",
+    "test": "node --test --test-concurrency=1 \"test/unit/*.test.mjs\"",
+    "test:integration": "node --test --test-concurrency=1 \"test/integration/*.test.mjs\"",
+    "test:bundlers": "node --test --test-concurrency=1 \"test/bundlers/*.test.mjs\"",
+    "test:e2e": "node test/e2e/run.mjs",
+    "test:e2e:threads": "node test/e2e/threads.mjs",
+    "check:tarball": "node scripts/check-tarball.mjs",
+    "serve": "node scripts/serve.mjs",
+    "prepack": "node scripts/build-worklet.mjs --check && node scripts/check-package.mjs"
+  },
+  "keywords": [
+    "speech-to-text",
+    "speech-recognition",
+    "czech",
+    "cestina",
+    "whisper",
+    "whisper.cpp",
+    "webassembly",
+    "wasm",
+    "webgpu",
+    "vad",
+    "offline",
+    "on-device",
+    "privacy",
+    "browser"
+  ],
+  "author": "Moravian AI <info@moravian.ai>",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "homepage": "https://moravian.ai/czechspeech/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moravian-ai/czechspeech-web.git"
+  },
+  "bugs": {
+    "email": "info@moravian.ai"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22",
+      "onFail": "error"
+    }
+  },
+  "devDependencies": {
+    "playwright-core": "1.64.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.6",
+    "webpack": "5.112.2"
+  }
+}

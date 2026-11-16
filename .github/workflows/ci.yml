@@ -1,0 +1,51 @@
+# Builds the WebAssembly modules from the pinned whisper.cpp with the pinned Emscripten, then runs the unit tests (the
+# public API listing included), the bundler tests and the tarball check (pack, install into an empty project, import,
+# type-check). The integration and browser tests need the 474 MB model and a GPU and are run by hand (see the README).
+# Nothing is published from CI.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CZECHSPEECH_TEST_TIME_SCALE: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Emscripten
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build rsync patch
+          git clone --depth 1 https://github.com/emscripten-core/emsdk "$HOME/emsdk"
+          EMSCRIPTEN_VERSION=$(sed -n "s/^EMSCRIPTEN_VERSION=//p" native/build-wasm.sh)   # single source of truth: the build script
+          "$HOME/emsdk/emsdk" install "$EMSCRIPTEN_VERSION"
+          "$HOME/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
+      - name: WebAssembly modules (mt, st, webgpu)
+        env:
+          JOBS: 4
+        run: |
+          export CZECHSPEECH_WASM_BUILD_DIR="$RUNNER_TEMP/czechspeech-web-build"
+          native/build-wasm.sh all
+          sha256sum src/wasm/*
+      - run: npm ci
+      - name: Unit tests
+        run: npm test
+      - name: Teardown of the threaded module (real WebAssembly, no model)
+        run: node --test --test-concurrency=1 test/integration/teardown.test.mjs
+      - name: Bundlers (Vite, webpack)
+        run: npm run test:bundlers
+      - name: Tarball (pack, install into an empty project, import, type-check)
+        run: npm run check:tarball
