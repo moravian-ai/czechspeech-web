@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-11-16)
+## 0.2.0 (2026-11-17)
 
 The first public release. No 0.1.0 was published on npm; compared with that first local build this release adds the WebGPU backend, `stop()`, the repetition-loop guard and
 the new `state` fields (see the README). The sections below are the behaviour changes since the 0.2.0 code was first
