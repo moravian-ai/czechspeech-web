@@ -41,6 +41,8 @@ jobs:
           native/build-wasm.sh all
           sha256sum src/wasm/*
       - run: npm ci
+      - name: Lint
+        run: npm run lint
       - name: Unit tests
         run: npm test
       - name: Teardown of the threaded module (real WebAssembly, no model)

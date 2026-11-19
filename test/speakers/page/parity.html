@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Speaker embedding parity</title>
+<script type="module">
+// Everything comes from the local test server. Nothing is sent anywhere.
+import { SpeakerEngine } from '/src/speakers/engine.js';
+import { VoiceprintModel } from '/src/speakers/model.js';
+import { STRICT } from '/src/speakers/points.js';
+
+function wavSamples(buf) {
+  const dv = new DataView(buf);
+  let pos = 12;
+  while (pos + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(dv.getUint8(pos), dv.getUint8(pos + 1), dv.getUint8(pos + 2), dv.getUint8(pos + 3));
+    const size = dv.getUint32(pos + 4, true);
+    if (id === 'data') {
+      const n = Math.min(size, buf.byteLength - pos - 8) >> 1;
+      const x = new Float32Array(n);
+      for (let i = 0; i < n; i++) x[i] = dv.getInt16(pos + 8 + 2 * i, true) / 32768;
+      return x;
+    }
+    pos += 8 + size + (size & 1);
+  }
+  throw new Error('no data chunk');
+}
+
+window.runParity = async ({ modelUrl, pins, threads, cuts, audioUrl }) => {
+  const model = await VoiceprintModel.download({ url: modelUrl, assetBaseUrl: `${location.origin}/src/`, _pins: pins });
+  const engine = await SpeakerEngine.create({ model, threads, point: STRICT, assetBaseUrl: `${location.origin}/src/` });
+  const src = wavSamples(await (await fetch(audioUrl)).arrayBuffer());
+  const out = {};
+  const ms = {};
+  for (const s of cuts) {
+    const n = Math.round(s * 16000);
+    const x = new Float32Array(n);
+    for (let i = 0; i < n; i++) x[i] = src[i % src.length];
+    const t0 = performance.now();
+    out[s] = Array.from(await engine.embed(x));
+    ms[s] = Math.round(performance.now() - t0);
+  }
+  const result = { ...out, isolated: self.crossOriginIsolated, threads: engine.threads, ms };
+  await engine.close();
+  await VoiceprintModel.delete({ _pins: pins });
+  return result;
+};
+window.parityReady = true;
+</script>

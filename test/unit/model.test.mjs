@@ -437,6 +437,28 @@ test('a model from fromUrl() and fromBytes() is Czech by default and has no id',
   assert.equal((await CzechSpeechModel.fromBytes(new Uint8Array(4), { tokensPerSecond: 27 })).tokensPerSecond, 27);
 });
 
+test('a self-hosted model with languages is accepted and verified by its SHA-256 (the README snippet)', async () => {
+  reset();
+  const caches = new MemoryCacheStorage();
+  const url = `${base}/model.bin`;
+  const model = await CzechSpeechModel.fromUrl(url, { sha256: SHA, size: SIZE, languages: ['cs', 'sk', 'en'], tokensPerSecond: 25,
+    _caches: caches });
+  assert.equal(model.id, null);
+  assert.equal(model.sha256, SHA);
+  assert.deepEqual([...model.languages], ['cs', 'sk', 'en']);
+  assert.equal(model.tokensPerSecond, 25);
+  assert.ok(Buffer.from(await blobBytes(model)).equals(data));
+  assert.equal(await CzechSpeechModel.isDownloaded({ url, sha256: SHA, size: SIZE }, { _caches: caches }), true);
+  // a file that does not match the given hash is refused and not kept
+  behaviour.corrupt = true;
+  const other = new MemoryCacheStorage();
+  await assert.rejects(
+    CzechSpeechModel.fromUrl(url, { sha256: SHA, size: SIZE, languages: ['cs', 'sk', 'en'], _caches: other }),
+    (e) => e.code === 'download' && /SHA-256 mismatch/.test(e.message),
+  );
+  assert.equal(await CzechSpeechModel.isDownloaded({ url, sha256: SHA, size: SIZE }, { _caches: other }), false);
+});
+
 test('isDownloaded({ id }) and delete({ id }) find the file stored under the pinned sha256', async () => {
   const caches = new MemoryCacheStorage();
   const cache = await caches.open(CACHE_NAME);

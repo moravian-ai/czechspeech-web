@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>CzechSpeech encryption check</title>
+</head>
+<body>
+  <p>Decryption of encrypted model files in a real browser (driven by test/e2e/encryption.mjs).</p>
+  <script type="module">
+    import { createDecryptor } from '../../src/encryption.js';
+    import { CzechSpeechModel } from '../../src/model.js';
+    window.enc = { createDecryptor, CzechSpeechModel };
+    window.encReady = true;
+  </script>
+</body>
+</html>

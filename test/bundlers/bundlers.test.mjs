@@ -3,6 +3,9 @@
 // WebAssembly modules (Emscripten JS and .wasm) and the Silero VAD model must be emitted unchanged and referenced.
 // Each emitted Emscripten module must find what it loads under the name the bundler gave it: no file is resolved next
 // to it by a fixed name except its own .wasm, which the SDK always passes through locateFile.
+// The speakers (src/speakers/engine.js, model.js and the worker behind them) are not exported from the package yet, so a
+// second app imports their files by path: the speaker worker must be bundled, and onnxruntime's wasm and its Emscripten
+// loader emitted unchanged and referenced (a bundler never sees a file that is only named by a directory).
 // No model, no browser; heavier than the unit tests (npm run test:bundlers). The WebAssembly modules are built by
 // native/build-wasm.sh and not in the repository: where they are missing, stand-ins with the same references to
 // themselves take their place, post-processed as the build does (scripts/fix-glue.mjs).
@@ -19,6 +22,10 @@ const NAME = pkg.name;
 // What `new URL('./…', import.meta.url)` in src/speech.js points at, relative to src/
 const ASSETS = ['worklet.js', 'wasm/czechspeech-mt.js', 'wasm/czechspeech-mt.wasm', 'wasm/czechspeech-st.js',
   'wasm/czechspeech-st.wasm', 'wasm/czechspeech-webgpu.js', 'wasm/czechspeech-webgpu.wasm', 'assets/ggml-silero-v6.2.0.bin'];
+// What the speaker app must find in the output: the files of onnxruntime-web, by their path in the package
+const ORT_ASSETS = ['speakers/ort/ort-wasm-simd-threaded.wasm', 'speakers/ort/ort-wasm-simd-threaded.mjs'];
+// A string of src/speakers/worker.js: the chunk that has it is the bundled speaker worker
+const SPEAKER_WORKER_MARKERS = ['runtime.slice(0, runtime.size'];
 // Strings of src/worker-core.js and src/engine-wasm.js: the chunk that has them is the bundled worker
 const WORKER_MARKERS = ['recogniser worker: unknown message', 'engine was wiped'];
 
@@ -63,6 +70,11 @@ before(() => {
   fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({ name: 'app', private: true, type: 'module' }));
   fs.writeFileSync(path.join(tmp, 'main.js'),
     `import { CzechSpeech, CzechSpeechModel } from '${NAME}';\nglobalThis.app = { CzechSpeech, CzechSpeechModel };\n`);
+  fs.writeFileSync(path.join(tmp, 'speakers.js'),
+    `import { SpeakerEngine } from './node_modules/${NAME}/src/speakers/engine.js';\n` +
+    `import { VoiceprintModel } from './node_modules/${NAME}/src/speakers/model.js';\n` +
+    'globalThis.speakers = { SpeakerEngine, VoiceprintModel };\n');
+  fs.writeFileSync(path.join(tmp, 'speakers.html'), '<!doctype html><script type="module" src="/speakers.js"></script>\n');
   fs.writeFileSync(path.join(tmp, 'index.html'), '<!doctype html><script type="module" src="/main.js"></script>\n');
 });
 
@@ -166,4 +178,59 @@ test('webpack 5 builds an app with the package: worker bundled, worklet, WebAsse
   // webpack loads a worker chunk by its id: the entry refers to it as `__webpack_require__.u(<id>)`
   checkOutput(outDir, { entry: path.join(outDir, 'main.js'),
     workerRef: (f) => `__webpack_require__.u(${JSON.stringify(path.basename(f).replace(/\.chunk\.js$/, ''))}`.replace(/"(\d+)"/, '$1') });
+});
+
+/**
+ * The speaker app's output: the speaker worker is a chunk of its own that the entry refers to, and the two onnxruntime
+ * files are emitted once, byte for byte, and named in the code that loads them (the worker's chunk or the entry's: the
+ * wasm is named by model.js in the entry, the loader by the worker).
+ */
+function checkSpeakerOutput(outDir, { entry }) {
+  const files = filesIn(outDir);
+  const js = files.filter((f) => f.endsWith('.js') || f.endsWith('.mjs'));
+  const text = new Map(js.map((f) => [f, fs.readFileSync(f, 'utf8')]));
+  const all = [...text.values()].join('\n');
+  for (const asset of ORT_ASSETS) {
+    const bytes = fs.readFileSync(path.join(pkgDir, 'src', asset));
+    const copies = files.filter((f) => fs.statSync(f).size === bytes.length && fs.readFileSync(f).equals(bytes));
+    assert.equal(copies.length, 1, `${asset}: emitted ${copies.length} times unchanged (${files.map((f) => path.basename(f))})`);
+    assert.ok(all.includes(path.basename(copies[0])), `${asset} emitted as ${path.basename(copies[0])}, which no code refers to`);
+  }
+  const workers = js.filter((f) => SPEAKER_WORKER_MARKERS.every((m) => text.get(f).includes(m)));
+  assert.equal(workers.length, 1, `the speaker worker bundled into ${workers.length} chunks`);
+  assert.notEqual(workers[0], entry, 'the speaker worker has a chunk of its own');
+  assert.ok(!/from\s*['"]\.\/worker-core\.js['"]/.test(text.get(workers[0])), 'the speaker worker chunk is bundled (no import left)');
+  assert.ok(!all.includes("'./ort/'") && !all.includes('"./ort/"'), 'a directory URL left in the output');
+}
+
+test('Vite 8 builds an app with the speakers: worker bundled, onnxruntime wasm and loader emitted and referenced', async () => {
+  const { build } = await import('vite');
+  const outDir = path.join(tmp, 'dist-vite-speakers');
+  const warnings = [];
+  const logger = {
+    info() {}, clearScreen() {}, hasErrorLogged: () => false, hasWarned: false,
+    warn: (m) => warnings.push(m), warnOnce: (m) => warnings.push(m), error: (m) => warnings.push(m),
+  };
+  await build({ root: tmp, configFile: false, logLevel: 'warn', customLogger: logger,
+    build: { outDir, emptyOutDir: true, minify: false, rollupOptions: { input: path.join(tmp, 'speakers.html') } } });
+  assert.deepEqual(warnings.filter((w) => /czechspeech|speakers/i.test(w)), [], warnings.join('\n'));
+  const entry = filesIn(outDir).find((f) => /[\\/]assets[\\/]speakers-[^\\/]*\.js$/.test(f));
+  assert.ok(entry, 'the speakers entry is not in the output');
+  checkSpeakerOutput(outDir, { entry });
+});
+
+test('webpack 5 builds an app with the speakers: worker bundled, onnxruntime wasm and loader emitted and referenced', async () => {
+  const { default: webpack } = await import('webpack');
+  const outDir = path.join(tmp, 'dist-webpack-speakers');
+  const stats = await new Promise((resolve, reject) => {
+    webpack({
+      mode: 'production', context: tmp, entry: './speakers.js',
+      output: { path: outDir, filename: 'speakers-main.js', chunkFilename: '[id].chunk.js', clean: true },
+      optimization: { minimize: false }, devtool: false, performance: { hints: false },
+    }, (err, s) => (err ? reject(err) : resolve(s)));
+  });
+  const info = stats.toJson({ all: false, errors: true, warnings: true });
+  assert.deepEqual(info.errors.map((e) => e.message), []);
+  assert.deepEqual(info.warnings.map((w) => `${w.moduleName}: ${w.message}`), [], 'no warnings (e.g. "Critical dependency")');
+  checkSpeakerOutput(outDir, { entry: path.join(outDir, 'speakers-main.js') });
 });

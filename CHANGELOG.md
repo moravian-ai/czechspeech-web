@@ -1,8 +1,26 @@
 # Changelog
 
-## 0.2.0 (2026-11-17)
+## 0.3.0 (2026-11-19)
 
-The first public release. No 0.1.0 was published on npm; compared with that first local build this release adds the WebGPU backend, `stop()`, the repetition-loop guard and
+The first version published on npm (0.2.0 was prepared but never published; its changes are below). Speakers. Everything is optional: without `speakers` nothing changes except the new `utteranceId`.
+
+- **Encrypted self-hosted model files (additive).** `CzechSpeechModel.fromUrl(url, { sha256, encryption: { algorithm: 'AES-256-CTR', key, iv } })` (and a `source` of `download()` with a `sha256` of its own) decrypts an AES-256-CTR file while it streams in, resumes with `Range` as before, caches the plaintext and verifies the plaintext `sha256` (required with `encryption`). It protects the file on the server only, not in the browser, and a key and IV must never be used for a second file. New `ModelEncryption` and `PinnedModelSource` types, `ModelSource.encryption`; needs `crypto.subtle` (a secure context), else error code `'unsupported'`. See the README, "Encrypting the hosted file".
+- **Consent is the app's duty.** A voiceprint is personal data: use speakers only after everyone whose voice is processed has agreed. The SDK keeps voiceprints on the device only and never stores or sends them; it does not check consent.
+- **`listen({ speakers })`** with a `SpeakerSession` tells who spoke, on the device: one `SpeakersEvent` follows each
+  transcript with the same `utteranceId` ("Speaker 1", "Speaker 2"...). The numbers belong to the meeting and survive
+  `stop()` and the next `listen()` with the same session. `stop()` waits at most 10 s for the last speakers.
+- **Speakers are numbered only for utterances that get a transcript**, and `SpeakersEvent.skipped` tells one failed
+  utterance (`'error'`, the speaker worker lives on) from a dead worker or a closed session (`'failed'`).
+- **`VoiceprintModel`** downloads and caches the voiceprint model and the onnxruntime-web 1.31.1 (MIT) runtime;
+  `SpeakerSession`, `SpeakersEvent`, `VOICEPRINT_MODELS`, `DEFAULT_VOICEPRINT_ID` and `speakerSupport()` are exported.
+  `MODELS.cs.voiceprint` names the voiceprint model of the Czech model.
+- **`TranscriptEvent.utteranceId`** (always set), `CzechSpeechState.speakers`, new error codes `'voiceprint-model'`,
+  `'enroll-too-short'`, `'enroll-too-noisy'`.
+- The package grows by the bundled onnxruntime runtime (about 3.8 MB gzipped), whether you use speakers or not.
+
+## 0.2.0 (prepared 17 Nov 2026, never published)
+
+Prepared and never published: its changes are part of 0.3.0, the first version on npm. No 0.1.0 was published either; compared with that first local build this release adds the WebGPU backend, `stop()`, the repetition-loop guard and
 the new `state` fields (see the README). The sections below are the behaviour changes since the 0.2.0 code was first
 assembled; they matter if you tried a pre-release build.
 

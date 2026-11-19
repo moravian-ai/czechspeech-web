@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Endpointer, FRAME_MS, FRAME_SAMPLES } from '../../src/endpointer.js';
 import { DEFAULT_CONFIG, resolveConfig } from '../../src/config.js';
+import { speechSpan } from '../../src/speakers/maths.js';
 
 const config = resolveConfig();
 const frameMs = FRAME_MS;
@@ -217,4 +218,34 @@ test('emittedUtterancesAreCopies', () => {
   run.feed(0.9, 20); // reuse of the internal buffer must not touch the emitted copy
   run.feed(0.02, 19);
   assert.equal(run.frames(u)[0], 0);
+});
+
+// --- audioStartMs: where the audio of an utterance begins (speaker worker) ---
+function runProbs(probs, cfg = DEFAULT_CONFIG) {
+  const out = [];
+  const ep = new Endpointer(cfg, (ev) => { if (ev.kind === 'utterance') out.push(ev); });
+  for (const p of probs) ep.accept(new Float32Array(512).fill(0.1), p);
+  ep.finish();
+  return out;
+}
+const frameList = (n, p) => Array(n).fill(p);
+
+test('utterance carries audioStartMs: the start of its audio, pre-roll included', () => {
+  const [u] = runProbs([...frameList(5, 0), ...frameList(20, 0.9), ...frameList(25, 0)]);
+  assert.deepEqual([u.audioStartMs, u.startMs, u.endMs, u.samples.length], [0, 160, 800, 44 * 512]);
+  assert.equal(speechSpan(u.samples, u.audioStartMs, u.endMs).length, 25 * 512);
+});
+
+test('pre-roll is at most 300 ms (10 frames)', () => {
+  const [u] = runProbs([...frameList(15, 0), ...frameList(20, 0.9), ...frameList(25, 0)]);
+  assert.deepEqual([u.audioStartMs, u.startMs, u.endMs], [160, 480, 1120]);
+  assert.equal(speechSpan(u.samples, u.audioStartMs, u.endMs).length, 30 * 512);
+});
+
+test('a piece cut at maxUtteranceMs: its speech span is the whole piece', () => {
+  const probs = frameList(200, 0.9);
+  probs[110] = 0.3;                                  // the quietest frame of the last 2 s before the cap
+  const [first] = runProbs(probs, { ...DEFAULT_CONFIG, maxUtteranceMs: 4000 });
+  assert.equal(first.audioStartMs, 0);
+  assert.equal(speechSpan(first.samples, first.audioStartMs, first.endMs).length, first.samples.length);
 });

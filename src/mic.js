@@ -92,7 +92,7 @@ export async function openMicrophone({ workletUrl, audio, stream }) {
       node.port.onmessage = (e) => { if (e.data && e.data.type === 'finished') resolve(!!e.data.delivered); };
     });
     const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(false), FINISH_TIMEOUT_MS); });
-    let delivered = false;
+    let delivered;
     try {
       node.port.postMessage({ type: 'finish' });
       delivered = await Promise.race([acked, timeout]);

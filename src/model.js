@@ -9,6 +9,7 @@
 
 import { CzechSpeechError } from './events.js';
 import { Sha256 } from './sha256.js';
+import { normalizeEncryption, createDecryptor } from './encryption.js';
 import { MODELS, DEFAULT_MODEL_ID, catalogEntry } from './catalog.js';
 
 export const CACHE_NAME = 'czechspeech-models';
@@ -40,20 +41,29 @@ function normalizeRate(tokensPerSecond) {
 /** The catalog id of a { id } source argument (TypeError when mixed with url, sha256 or size), else undefined. */
 function idOf(source) {
   if (!source || typeof source !== 'object' || !('id' in source)) return undefined;
-  if ('url' in source || 'sha256' in source || 'size' in source) throw new TypeError('pass either { id } or { url, size?, sha256? }, not both');
+  if ('url' in source || 'sha256' in source || 'size' in source || 'encryption' in source) {
+    throw new TypeError('pass either { id } or { url, size?, sha256?, encryption? }, not both');
+  }
   return source.id;
 }
 
 function normalizeSource(source) {
   if (source === undefined) return DEFAULT_MODEL;
   if (typeof source === 'string') return { url: source, size: null, sha256: null };
-  if (!source || typeof source.url !== 'string') throw new TypeError('source must be a URL or { url, size?, sha256? }');
+  if (!source || typeof source.url !== 'string') throw new TypeError('source must be a URL or { url, size?, sha256?, encryption? }');
   const sha256 = source.sha256 ? String(source.sha256).toLowerCase() : null;
   if (sha256 && !HEX64.test(sha256)) throw new TypeError('sha256 must be 64 hex digits');
   if (source.size != null && !(Number.isSafeInteger(source.size) && source.size > 0)) {
     throw new TypeError('size must be a positive integer');
   }
-  return { url: source.url, size: source.size ?? null, sha256 };
+  const result = { url: source.url, size: source.size ?? null, sha256 };
+  if (source.encryption != null) {
+    const encryption = normalizeEncryption(source.encryption);
+    // without the plaintext hash a wrong key would go unnoticed and the model would be noise
+    if (!sha256) throw new TypeError('an encrypted model needs its sha256 (of the plaintext), so that a wrong key is noticed');
+    result.encryption = encryption;
+  }
+  return result;
 }
 
 /**
@@ -67,6 +77,7 @@ function pinnedSource(source) {
   if (id !== undefined) return catalogEntry(id).source;
   const src = normalizeSource(source);
   if (src.sha256 && src.sha256 !== DEFAULT_MODEL.sha256) return src;
+  if (src.encryption) throw new TypeError('the pinned model is not served encrypted; for an encrypted file of your own pass the sha256 of its plaintext, which differs from the pinned one');
   if (src.size !== null && src.size !== DEFAULT_MODEL.size) {
     throw new TypeError(`a mirror serves the pinned model (${DEFAULT_MODEL.size} bytes); for another file pass its ` +
       'sha256, or use CzechSpeechModel.fromUrl()');
@@ -74,7 +85,7 @@ function pinnedSource(source) {
   return { url: src.url, size: DEFAULT_MODEL.size, sha256: DEFAULT_MODEL.sha256 };
 }
 
-function checkUrl(url) {
+export function checkUrl(url) {
   let u;
   try {
     u = new URL(url, globalThis.location ? globalThis.location.href : undefined);
@@ -162,9 +173,11 @@ function storageError(err, reading = false) {
 
 /**
  * Downloads `src` into the cache (resuming from stored parts), verifies size and SHA-256, and returns the Blob.
+ * With `src.encryption` the download is decrypted chunk by chunk: the cache and the Blob hold the plaintext, `size`
+ * and `sha256` are those of the plaintext.
  * Without Cache Storage, or without a known SHA-256, it downloads into memory.
  */
-async function download(src, { onProgress, signal, caches: cachesOverride, fetch: fetchImpl }) {
+export async function downloadFile(src, { onProgress, signal, caches: cachesOverride, fetch: fetchImpl }) {
   const doFetch = fetchImpl || globalThis.fetch;
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
   const id = src.sha256;
@@ -185,6 +198,7 @@ async function download(src, { onProgress, signal, caches: cachesOverride, fetch
   if (cache && meta && !resumable) await deleteEntries(cache, id, meta.parts);
   if (!resumable) meta = null;
 
+  const decrypt = src.encryption ? createDecryptor(src.encryption, globalThis.crypto && globalThis.crypto.subtle) : null;
   let hasher = new Sha256();
   let parts = 0;
   let have = 0;
@@ -287,6 +301,7 @@ async function download(src, { onProgress, signal, caches: cachesOverride, fetch
       if (total && have + bytes.length > total) {
         throw new CzechSpeechError(`Server sent more than ${total} bytes`, { code: 'download' });
       }
+      if (decrypt) bytes = await decrypt(bytes, have); // `have` is the file offset of this chunk
       hasher.update(bytes);
       have += bytes.length;
       while (bytes.length > 0) {
@@ -328,6 +343,29 @@ async function download(src, { onProgress, signal, caches: cachesOverride, fetch
   }
   progress(have, have);
   return { blob, cached: !!cache, sha256: actual };
+}
+
+/** True when the file `src` ({ sha256, size }) is completely in the cache. Cheap: no hashing, no network. */
+export async function isFileCached(src, { caches: cachesOverride } = {}) {
+  const cs = cacheStorage(cachesOverride);
+  if (!cs) return false;
+  const cache = await openCache(cs);
+  const id = src.sha256;
+  const meta = await readMeta(cache, id);
+  if (!meta || !meta.complete || (src.size && meta.size !== src.size)) return false;
+  for (let i = 0; i < meta.parts; i++) if (!(await cacheOp(() => cache.match(keyOf(id, partName(i)))))) return false;
+  return true;
+}
+
+/** Deletes the cached file `src` ({ sha256 }) and any partial download. True when something was stored. */
+export async function deleteCachedFile(src, { caches: cachesOverride } = {}) {
+  const cs = cacheStorage(cachesOverride);
+  if (!cs) return false;
+  const cache = await openCache(cs);
+  const id = src.sha256;
+  const meta = await readMeta(cache, id);
+  const n = await deleteEntries(cache, id, meta ? meta.parts : 0);
+  return !!(meta || n > 0);
 }
 
 /** A CzechSpeech model ready for CzechSpeech.create(). Create with download(), fromUrl() or fromBytes(). */
@@ -388,9 +426,12 @@ export class CzechSpeechModel {
    * isDownloaded() and delete() with the same { url, sha256 }) and the download resumable. Without it, the file is
    * downloaded into memory each time and not stored (nothing could find it again: a URL alone means the pinned model
    * to isDownloaded() and delete()); its SHA-256 is computed.
+   *
+   * `encryption: { algorithm: 'AES-256-CTR', key, iv }` (64 and 32 hex digits) says the hosted file is encrypted:
+   * it is decrypted while it streams in, the cache holds the plaintext, and `sha256` (required then) is the plaintext's.
    */
   static async fromUrl(url, options = {}) {
-    const src = normalizeSource({ url, size: options.size, sha256: options.sha256 });
+    const src = normalizeSource({ url, size: options.size, sha256: options.sha256, encryption: options.encryption });
     normalizeLanguages(options.languages);
     normalizeRate(options.tokensPerSecond);
     return CzechSpeechModel.#fetch(src, options, { languages: options.languages, tokensPerSecond: options.tokensPerSecond });
@@ -398,7 +439,7 @@ export class CzechSpeechModel {
 
   static async #fetch(src, options, entry = {}) {
     const s = { ...src, url: checkUrl(src.url) };
-    const r = await download(s, { onProgress: options.onProgress, signal: options.signal, caches: options._caches,
+    const r = await downloadFile(s, { onProgress: options.onProgress, signal: options.signal, caches: options._caches,
       fetch: options._fetch });
     return new CzechSpeechModel(CzechSpeechModel.#token, { blob: r.blob, size: r.blob.size, sha256: r.sha256, cached: r.cached,
       id: entry.id ?? null, languages: entry.languages, tokensPerSecond: entry.tokensPerSecond });
@@ -429,15 +470,7 @@ export class CzechSpeechModel {
    * is found by its { url, sha256 }; one without sha256 is never cached.
    */
   static async isDownloaded(source, options = {}) {
-    const src = pinnedSource(source);
-    const cs = cacheStorage(options._caches);
-    if (!cs) return false;
-    const cache = await openCache(cs);
-    const id = src.sha256;
-    const meta = await readMeta(cache, id);
-    if (!meta || !meta.complete || (src.size && meta.size !== src.size)) return false;
-    for (let i = 0; i < meta.parts; i++) if (!(await cacheOp(() => cache.match(keyOf(id, partName(i)))))) return false;
-    return true;
+    return isFileCached(pinnedSource(source), { caches: options._caches });
   }
 
   /**
@@ -446,14 +479,7 @@ export class CzechSpeechModel {
    * deleted by its { url, sha256 }; one without sha256 is never cached.
    */
   static async delete(source, options = {}) {
-    const src = pinnedSource(source);
-    const cs = cacheStorage(options._caches);
-    if (!cs) return false;
-    const cache = await openCache(cs);
-    const id = src.sha256;
-    const meta = await readMeta(cache, id);
-    const n = await deleteEntries(cache, id, meta ? meta.parts : 0);
-    return !!(meta || n > 0);
+    return deleteCachedFile(pinnedSource(source), { caches: options._caches });
   }
 
   /** Node.js tests only: a model read from a file path inside a worker thread. */

@@ -9,9 +9,9 @@ speech.
 You install one package, iterate `listen()` and get Czech transcripts. To stop, leave the loop. **Audio never leaves
 the page**: it is recognised in Web Workers on the user's machine and is never stored or sent anywhere.
 
-Version 0.2.0, the first public release: the web counterpart of CzechSpeech for Android 0.2.0 (same model, same speech detection, same
-results), now with a WebGPU backend (see [Backend: WebGPU or CPU](#backend-webgpu-or-cpu)). See
-[What has been tested](#what-has-been-tested).
+Version 0.3.0, the first public release (a 0.2.0 was prepared but never published): the web counterpart of CzechSpeech for Android 0.3.0
+(same model, same speech detection, same results), with a WebGPU backend (see [Backend: WebGPU or CPU](#backend-webgpu-or-cpu)) and
+speaker recognition on the device (see [Speakers](#speakers)). See [What has been tested](#what-has-been-tested).
 
 ## Install
 
@@ -210,6 +210,66 @@ model.tokensPerSecond;  // 25: the cap of tokens per second of audio (see "Decod
   its length (short utterances most, relatively). Measured once, on one machine, with the current model and decoder (the CzechSpeech q4_0 model declared as cs + en, 5 repetitions, 2 to 13.9 s of audio, an idle 22-logical-core notebook with an Intel Xe-LPG GPU): detection adds about 54 s per utterance on the CPU (WebAssembly, 6 threads; a 2 s utterance takes 5 s forced and 60 s with detection) and about 4.3 s on WebGPU (1.1 s forced, 6.2 s with detection), independent of the utterance length, because it always encodes a full 30 s window; the detection overhead is the same on the first call of a session as on later ones (the first call itself is slower for start-up, e.g. 2.7 s against 1.1 s for a forced 2 s utterance on WebGPU). The detected transcripts were word for word those of the forced runs, and over 24 consecutive detect recognitions on WebGPU the GPU buffers stayed flat at 833.4 MiB in 13 buffers, none left after close(). On the CPU a multi-language model is therefore impractical for now; `CZECHSPEECH_E2E_DETECT_COST=1 node test/e2e/detect-cost.mjs` measures it on your machine (opt-in, see [Building from source](#building-from-source)). Force `language` when the app knows it.
   Czech (one language) pays nothing.
 
+### Your own or a licensed model
+
+The public catalogue holds the free Czech model only. A model that is not in it, for example a model of several languages
+that a company licensed from Moravian AI (the Czech, Slovak and English enterprise model is gated on Hugging Face and
+its files go only to companies with a licence), is a file you host yourself: on your server, your CDN or in
+your app. You pass its URL and SHA-256 to the SDK, which verifies the file while it streams in and deletes it on a
+mismatch. No licence server is involved and nothing is sent to us.
+
+```js
+const model = await CzechSpeechModel.fromUrl('https://models.example.com/my-model.bin', {
+  sha256: '<64 hex digits of your file>',   // verified; with it the file is also cached and resumable
+  size: 474000000,                          // optional: the expected size in bytes
+  languages: ['cs', 'sk', 'en'],            // what the model speaks; the default is ['cs']
+  tokensPerSecond: 25,                      // the decoding cap, see "Decoding limits"
+});
+const speech = await CzechSpeech.create({ model });
+```
+
+There is no language rule on the web yet: a model of several languages picks its language in one pass among its
+`languages`, and you force one with `language` per call (see above). The enterprise model and its licence are available
+on request at info@moravian.ai.
+
+#### Encrypting the hosted file
+
+If the file sits at a public URL that you do not want to advertise, host it encrypted so that a found URL is useless
+without the key, and pass the key with the source. The SDK decrypts while the file streams in (chunk by chunk with
+WebCrypto, resume with `Range` works), the cache holds the plain model, and `sha256` is the hash of the plain model,
+verified after decryption as always; a wrong key is a "SHA-256 mismatch" and nothing is kept. Resuming an interrupted download needs `size`.
+
+```js
+const model = await CzechSpeechModel.fromUrl('https://models.example.com/my-model.bin.enc', {
+  sha256: '<64 hex digits of the PLAIN model>',   // required with encryption
+  size: 474000000,                                 // optional; encrypted and plain files have the same size
+  encryption: { algorithm: 'AES-256-CTR', key: '<64 hex digits>', iv: '<32 hex digits>' },
+});
+```
+
+The format is AES-256-CTR over the whole file: the ciphertext is as long as the plaintext, the 16-byte IV is the initial
+counter block, incremented as one 128-bit big-endian integer per 16-byte block (what WebCrypto's `{ name: 'AES-CTR',
+length: 128 }`, Java's `AES/CTR/NoPadding` and OpenSSL do). There is no MAC; the plaintext SHA-256 is the integrity
+check. **Never encrypt two different files with the same key and IV** (a new version of a model gets a new key, or at
+least a new IV): the two ciphertexts would reveal the XOR of the two plaintexts. The key and the IV belong to the hosted
+file: publish a re-encrypted file under a new URL, and never replace the file behind a URL that released apps use. To
+encrypt with OpenSSL, keeping the key and the IV in a file only you can read:
+
+```
+key=$(openssl rand -hex 32); iv=$(openssl rand -hex 16)
+openssl enc -aes-256-ctr -K "$key" -iv "$iv" -in model.bin -out model.bin.enc
+(umask 077; printf 'key=%s\niv=%s\n' "$key" "$iv" > model.key)
+```
+
+The Android SDK repository (github.com/moravian-ai/czechspeech-android) has `scripts/encrypt-model.sh` for this, which also
+streams (`-` for stdin and stdout) and checks the result against the hash and size you know. Run it on a machine you do
+not share, as OpenSSL takes the key on its command line. The length of the encrypted file reveals the size of the model. Decryption needs `crypto.subtle`, which browsers offer only in a secure context (https or localhost); without it
+the download fails with the error code `'unsupported'`. The key is never put into an error message.
+
+**What this protects, exactly:** the file on your server or CDN. Someone who finds the URL gets noise. It does not
+protect the model in the browser: the decrypted model is in the page's Cache Storage and the key is part of your page, so
+anyone who opens the developer tools can get both. It is access control for hosting, not copy protection.
+
 ## Listen
 
 ```js
@@ -293,6 +353,60 @@ Or bring your own stream: `speech.listen({ stream })` (it is not stopped at the 
 The audio context runs at the device's native rate (44.1 or 48 kHz usually); the worklet resamples to 16 kHz
 itself with a windowed-sinc filter, because a 16 kHz `AudioContext` fed by a microphone does not work in every
 browser.
+
+## Speakers
+
+`listen()` can also tell **who** spoke: "Speaker 1", "Speaker 2" and so on, on the device. It is optional and off unless you
+pass a `SpeakerSession`. The SDK only computes; names and anything stored are the app's business. **Turn speakers on only after everyone whose voice will be processed has agreed (show a consent screen): a voiceprint is personal data, and biometric data when it is used to recognise a person. The SDK keeps voiceprints in the page's worker memory only, never stores, sends or logs them, and zeroes them on `close()`; it does not check consent, that is the app's duty.** A voiceprint
+is a row of numbers worked out from how a voice sounds; this SDK never stores one, never sends one and never writes
+one to a log, and it does not look at emotion or tone.
+
+```js
+import { CzechSpeech, SpeakerSession, VoiceprintModel, speakerSupport } from '@moravianai/czechspeech';
+
+if (speakerSupport().supported) {
+  // the voiceprint model is not public: your app serves the file and says where (size and SHA-256 are pinned)
+  const voices = await VoiceprintModel.download({ url: '/models/voiceprint/<sha256>.onnx', onProgress });
+  const speakers = await SpeakerSession.create({ model: voices });          // one per meeting
+  for await (const ev of speech.listen({ speakers })) {
+    if (ev.type === 'transcript') append(ev.utteranceId, ev.text);
+    else if (ev.type === 'speakers') label(ev.utteranceId, ev.speakers);    // [{ kind: 'session', n: 2 }, ...] in speaking order
+  }
+  // pause, then listen({ speakers }) again with the same session: "Speaker 2" stays "Speaker 2"
+  await speakers.close();                                                   // zeroes the centres, ends the worker
+}
+```
+
+- **One `speakers` event follows each transcript** with the same `utteranceId`, never before it, even when the speaker
+  worker is faster: the transcript never waits for the speakers. An utterance without a transcript has no
+  `speakers` event. `parts` are the stretches of the utterance with the speaker found for each (`null`: not sure);
+  `speakers` lists the distinct ones in the order they spoke. The text of one utterance is not divided between speakers.
+- **The numbers belong to the meeting, not to one `listen()`.** The same `SpeakerSession` across `stop()` and the next
+  `listen()` goes on numbering. A label does not change once delivered: nothing is regrouped afterwards. After a recovery
+  pass `firstLabel` (the next free number) so that new speakers do not take numbers already in use.
+- **Speakers can be skipped, and the event says why** (`skipped`): `'cpu'` when the recogniser runs on the CPU and the
+  session was made with the default `onCpu: 'skip'` (the speaker worker would compete with the recogniser for the
+  processor; `onCpu: 'run'` computes anyway), `'behind'` when the speaker worker had too much waiting (it first stops
+  looking for speaker changes within an utterance, then skips utterances), `'error'` when this utterance failed (the speaker
+  worker lives on and the next utterance is handled), `'failed'` when the speaker worker is dead or the session was closed
+  (nothing more comes from it until a new `SpeakerSession`). The transcripts are not affected by any of it. `state.speakers` has the counts.
+- **`stop()` waits for the last speakers** for at most 10 s; what does not come in time is not delivered and is counted in
+  `state.speakers.lost`. A dead speaker worker does not block the end: it is reported as `'failed'`.
+- **Nobody is numbered for an utterance that has no transcript.** The speaker of an utterance is worked out when its transcript
+  is out: an utterance that the recogniser drops (a cough, a scrape) founds no "Speaker n" and moves no speaker's centre.
+- **Short pieces.** A piece shorter than 1 s never starts a new speaker; it joins one that sounds alike, or stays `null`.
+  Speech over each other is not detected.
+- **The voiceprint model and the runtime** (onnxruntime-web 1.31.1, MIT, bundled in `speakers/ort/`) are cached in the
+  browser like the speech model (`VoiceprintModel.download()`, `isDownloaded()`, `delete()`), so it all works offline
+  after one download. `runtimeUrl` lets the app serve the 15 MB WebAssembly file itself.
+- **Requirements.** WebAssembly SIMD and Web Workers (`speakerSupport()`). Two runtime threads on a cross-origin isolated
+  page with 8 or more cores, else one. The model needs about 40 MB (the model plus the runtime) and the worker a few
+  hundred MB while it runs; it holds at most 10 s of audio in one embedding, longer pieces are averaged from chunks.
+- **What it is measured on.** The settings (the `strict` operating point of `voiceprint-cs`) were chosen on synthetic
+  meetings of four to ten people made from parliament recordings, not on real meetings; speech from a loudspeaker, online
+  meetings and overlapping speech were not measured. Do not promise accuracy to your users from these numbers.
+- **Memory is zeroed, then released.** Every array that held audio or a voiceprint is filled with zeros when it has been
+  used; terminating the worker (`close()`) frees what the runtime holds that the SDK cannot reach.
 
 ## Transcribe audio you already have
 
@@ -506,7 +620,8 @@ What the SDK guarantees:
   decoded tokens, is suppressed; only its warnings and errors are passed on.
 - **The model is held only while needed:** loaded during `listen()` sessions and `transcribe()` calls, freed
   afterwards, unless you choose `keepModelLoaded`.
-- **No emotion or tone analysis and no speaker identification:** only the words.
+- **No emotion or tone analysis.** Speakers are told apart only when the app asks for it ([Speakers](#speakers)), on the device, and an app may compute or keep a voiceprint of a person only with that person's explicit consent (the SDK does not check it);
+  the SDK never stores or sends a voiceprint, and a speaker's label, key or number is not in any log or `toString()`.
 
 **Limits.** JavaScript strings cannot be zeroed: the transcript text you receive lives until it is garbage
 collected. The browser's own audio pipeline (getUserMedia, the audio thread) is outside the SDK's control. When a
@@ -654,25 +769,27 @@ short check, `listen()` and WebGPU in a bundled app, and machines other than the
 This SDK and the free Czech model are all you need for Czech. For companies, Moravian AI also offers an enterprise
 edition on request:
 
-- **CzechSpeech Enterprise:** one model for Czech, Slovak and English. Its Czech word error rate is equal or lower than
-  the free model's on our three Czech test sets; Slovak FLEURS 6.5 %, English FLEURS 6.6 %. Force the language per
-  call (see [Models and languages](#models-and-languages)).
-- **CzechSpeech Voiceprint:** speaker recognition (who said what), fine-tuned on Czech speech. Support in this SDK is
-  in preparation.
+- **CzechSpeech Enterprise cs+sk+en (beta):** one model for Czech, Slovak and English. Its Czech word error rate is the free model's
+  on Czech parliament speech (1.9 %), lower on FLEURS (7.3 % against 7.8 %) and 6.8 % against 6.7 % on noisy speech,
+  a difference within the margin of the measurement; Slovak FLEURS 6.6 %, English FLEURS 6.6 %. It is a beta: see
+  its model card at [huggingface.co/moravianai/CzechSpeech-Enterprise](https://huggingface.co/moravianai/CzechSpeech-Enterprise)
+  for where it falls short. Force the language per call (see [Models and languages](#models-and-languages)).
+- **CzechSpeech Voiceprint:** speaker recognition (who said what), fine-tuned on Czech speech. The SDK supports it (see
+  [Speakers](#speakers)); the model file is not public.
 - **Fine-tuning on your vocabulary and your recordings,** with the accuracy measured on your own data before you
   decide.
 - **Help with integration,** e-mail support and model updates.
 
 It uses this same public SDK. An enterprise model is a file that you host yourself or ship in your app, and you pass
-it with its SHA-256 as in [The model](#the-model). There is no licence server and no telemetry: audio and transcripts
+it as described in [Your own or a licensed model](#your-own-or-a-licensed-model). There is no licence server and no telemetry: audio and transcripts
 stay on the device, as with the free model.
 
 Write to info@moravian.ai.
 
 *Česky:* toto SDK s volným českým modelem stačí na češtinu. Firmám nabízí Moravian AI na vyžádání podnikovou verzi:
-- jeden model pro češtinu, slovenštinu a angličtinu (čeština má na našich třech českých testech stejnou nebo nižší
-  chybovost než volný model);
-- rozpoznávání řečníků doladěné na češtině (podporu v SDK připravujeme);
+- jeden model pro češtinu, slovenštinu a angličtinu, beta (čeština: v parlamentních záznamech stejná chybovost jako volný
+  model, na FLEURS nižší, v šumu 6,8 % proti 6,7 %, rozdíl v mezích měření);
+- rozpoznávání řečníků doladěné na češtině (SDK ho podporuje, soubor modelu není veřejný);
 - doladění na váš slovník a vaše nahrávky s přesností změřenou na vašich datech;
 - pomoc s nasazením.
 
@@ -691,5 +808,6 @@ ani telemetrie, zvuk zůstává v zařízení. Napište na info@moravian.ai.
 - **Bundled third-party components:** whisper.cpp and ggml (MIT, © The ggml authors; the WebGPU module contains a
   modified ggml WebGPU backend, see `native/patches/`), the Silero VAD v6.2.0 model
   (MIT, © Silero Team), Dawn's emdawnwebgpu WebGPU bindings (BSD 3-Clause, © The Dawn & Tint Authors, and
-  Emscripten's licence) and the Emscripten runtime and system libraries in the WebAssembly modules. See
-  [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+  Emscripten's licence), ONNX Runtime (onnxruntime-web 1.31.1, MIT, © Microsoft Corporation; the WebAssembly runtime
+  of speaker recognition, unchanged, in `src/speakers/ort/` with its own notices) and the Emscripten runtime and system
+  libraries in the WebAssembly modules. See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

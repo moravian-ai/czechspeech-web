@@ -1,6 +1,6 @@
 // The model catalog: models are picked by id ('cs'), and an entry carries what the engine needs to know about a
 // model: where its file is (pinned size and SHA-256), the languages it speaks and how fast a correct transcript
-// produces tokens. A catalog entry has no field for speaker voice prints yet; they are added with the speaker work.
+// produces tokens; `voiceprint` is the id of its speaker voiceprint model (src/speakers/catalog.js), or null.
 
 import { CzechSpeechError } from './events.js';
 
@@ -18,6 +18,7 @@ export const MODELS = Object.freeze({
     }),
     languages: Object.freeze(['cs']),
     tokensPerSecond: 25,
+    voiceprint: 'voiceprint-cs',
   }),
 });
 

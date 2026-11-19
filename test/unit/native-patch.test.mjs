@@ -50,6 +50,7 @@ function checkPackage(webgpuWasm) {
     fs.mkdirSync(path.join(dir, 'src/wasm'), { recursive: true });
     fs.copyFileSync(path.join(ROOT, 'scripts/check-package.mjs'), path.join(dir, 'scripts/check-package.mjs'));
     fs.copyFileSync(path.join(ROOT, 'scripts/fix-glue.mjs'), path.join(dir, 'scripts/fix-glue.mjs'));
+    fs.copyFileSync(path.join(ROOT, 'scripts/changelog-date.mjs'), path.join(dir, 'scripts/changelog-date.mjs'));
     fs.copyFileSync(path.join(ROOT, 'package.json'), path.join(dir, 'package.json'));
     fs.copyFileSync(path.join(ROOT, 'src/index.js'), path.join(dir, 'src/index.js'));
     fs.writeFileSync(path.join(dir, 'src/wasm/czechspeech-webgpu.wasm'), webgpuWasm);

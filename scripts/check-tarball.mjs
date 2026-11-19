@@ -81,6 +81,7 @@ export async function demo(signal: AbortSignal): Promise<string[]> {
     const e: SpeechEvent = ev;
     if (e.type === 'transcript') texts.push(e.text, String(e.startMs + e.endMs + e.processingMs));
     else if (e.type === 'error') texts.push(e.error.code);
+    else if (e.type === 'speakers') texts.push(e.utteranceId, String(e.parts.length + e.speakers.length), String(e.skipped));
     else texts.push(String(e.atMs));
   }
   for await (const t of speech.transcripts()) { const x: TranscriptEvent = t; texts.push(x.text); speech.stop(); }

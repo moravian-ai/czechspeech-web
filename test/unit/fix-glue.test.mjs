@@ -100,7 +100,7 @@ describe('static guards (no native build): the post-processing is wired into the
   test('scripts/check-package.mjs refuses a glue that loads its threads by a fixed name', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'czechspeech-check-'));
     try {
-      for (const f of ['scripts/check-package.mjs', 'scripts/fix-glue.mjs', 'package.json', 'src/index.js']) {
+      for (const f of ['scripts/check-package.mjs', 'scripts/fix-glue.mjs', 'scripts/changelog-date.mjs', 'package.json', 'src/index.js']) {
         fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
         fs.copyFileSync(path.join(ROOT, f), path.join(dir, f));
       }

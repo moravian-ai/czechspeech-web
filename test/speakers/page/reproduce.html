@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Speaker assignment reproduction</title>
+<script type="module">
+// Everything comes from the local test server. Nothing is sent anywhere. The page computes what needs the browser
+// runtime (speech probabilities, utterances, embeddings of their pieces, enrolment voiceprints); the test script does
+// the tagging and the scoring.
+import * as ort from '/src/speakers/ort/ort.wasm.min.mjs';
+import { SpeakerEngine } from '/src/speakers/engine.js';
+import { VoiceprintModel } from '/src/speakers/model.js';
+import { speechSpan, unit } from '/src/speakers/maths.js';
+import { Endpointer } from '/src/endpointer.js';
+import { DEFAULT_CONFIG } from '/src/config.js';
+
+const FRAME = 512;
+let engine = null;
+let silero = null;
+
+function wavSamples(buf) {
+  const dv = new DataView(buf);
+  let pos = 12;
+  while (pos + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(dv.getUint8(pos), dv.getUint8(pos + 1), dv.getUint8(pos + 2), dv.getUint8(pos + 3));
+    const size = dv.getUint32(pos + 4, true);
+    if (id === 'data') {
+      const n = Math.min(size, buf.byteLength - pos - 8) >> 1;
+      const x = new Float32Array(n);
+      for (let i = 0; i < n; i++) x[i] = dv.getInt16(pos + 8 + 2 * i, true) / 32768;
+      return x;
+    }
+    pos += 8 + size + (size & 1);
+  }
+  throw new Error('no data chunk');
+}
+const fetchWav = async (url) => wavSamples(await (await fetch(url)).arrayBuffer());
+
+/** Silero VAD v6.2 (ONNX) as research/speakers/vad.py: 64 samples of context + 512 new, state [2, 1, 128], no reset. */
+async function sileroProbs(x) {
+  const n = Math.floor(x.length / FRAME);
+  const out = new Float32Array(n);
+  const input = new Float32Array(64 + FRAME);
+  const sr = new ort.Tensor('int64', BigInt64Array.from([16000n]), []);
+  let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
+  for (let i = 0; i < n; i++) {
+    input.set(x.subarray(i * FRAME, (i + 1) * FRAME), 64);
+    const r = await silero.run({ input: new ort.Tensor('float32', input, [1, 64 + FRAME]), state, sr });
+    out[i] = r.output.data[0];
+    state = r.stateN;
+    input.copyWithin(0, FRAME, 64 + FRAME);
+  }
+  return out;
+}
+
+window.setup = async ({ modelUrl, pins, threads, point, sileroUrl }) => {
+  ort.env.wasm.wasmPaths = '/src/speakers/ort/';
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = false;
+  silero = await ort.InferenceSession.create(new Uint8Array(await (await fetch(sileroUrl)).arrayBuffer()), { executionProviders: ['wasm'] });
+  const model = await VoiceprintModel.download({ url: modelUrl, assetBaseUrl: `${location.origin}/src/`, _pins: pins });
+  engine = await SpeakerEngine.create({ model, threads, point, assetBaseUrl: `${location.origin}/src/` });
+  return { isolated: self.crossOriginIsolated, threads: engine.threads, ortWeb: ort.env.versions && ort.env.versions.web };
+};
+
+/** Utterances of a meeting -> pieces with their embeddings. vadUrl: a .f32 of probabilities, else Silero ONNX here. */
+window.embedMeeting = async ({ wavUrl, vadUrl }) => {
+  const audio = await fetchWav(wavUrl);
+  const probs = vadUrl ? new Float32Array(await (await fetch(vadUrl)).arrayBuffer()) : await sileroProbs(audio);
+  const utterances = [];
+  const ep = new Endpointer({ ...DEFAULT_CONFIG }, (ev) => { if (ev.kind === 'utterance') utterances.push(ev); });
+  for (let i = 0; i < probs.length; i++) ep.accept(audio.subarray(i * FRAME, (i + 1) * FRAME), probs[i]);
+  ep.finish();
+  const items = [];
+  const modes = {};
+  let computeMs = 0;
+  for (const u of utterances) {
+    const r = await engine.embedUtterance(speechSpan(u.samples, u.audioStartMs, u.endMs).slice());
+    modes[r.mode] = (modes[r.mode] || 0) + 1;
+    computeMs += r.computeMs;
+    for (const p of r.pieces) {
+      items.push({ startMs: u.audioStartMs + p.startMs, endMs: u.audioStartMs + p.endMs, vector: Array.from(p.vector) });
+    }
+    u.samples.fill(0);
+  }
+  return { items, utterances: utterances.length, modes, computeMs, frames: probs.length };
+};
+
+/** The stored voice of an enrolment recording, as research/speakers/assign.py enroll (no "several voices" check). */
+window.enrollPrint = async ({ wavUrl }) => {
+  const x = await fetchWav(wavUrl);
+  if (x.length < 10 * 16000) return { error: 'too_short' };
+  const probs = await sileroProbs(x);
+  let active = 0;
+  for (const p of probs) if (p >= 0.5) active++;
+  if (!probs.length || active / probs.length < 0.5) return { error: 'too_noisy' };
+  const speech = new Float32Array(active * FRAME);
+  let at = 0;
+  for (let i = 0; i < probs.length; i++) {
+    if (probs[i] >= 0.5) { speech.set(x.subarray(i * FRAME, (i + 1) * FRAME), at); at += FRAME; }
+  }
+  if (speech.length < 10 * 16000) return { error: 'too_short' };
+  const win = 3 * 16000;
+  const hop = 16000;
+  const sum = new Float32Array(192);
+  for (let s = 0; s <= Math.max(speech.length - win, 0); s += hop) {
+    const v = await engine.embed(speech.slice(s, s + win));
+    for (let i = 0; i < 192; i++) sum[i] += v[i];
+  }
+  return { vector: Array.from(unit(sum)) };
+};
+
+window.finish = async () => {
+  await engine.close();
+};
+window.reproduceReady = true;
+</script>

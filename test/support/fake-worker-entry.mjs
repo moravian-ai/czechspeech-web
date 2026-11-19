@@ -19,6 +19,7 @@
 //   gpuRestartDelayMs: ms                 every WebGPU start after the first (per worker) takes this long
 //   testFailRecognitionMs: ms             as in the real engine: the device is lost this many ms into the engine's first
 //                                         recognition (src/worker-core.js Backends passes it to the first engines only)
+//   emptyTextAt: n                        the n-th CPU recognition (1-based, per worker) returns no text
 //   capped: true                          every recognition reports that it reached a token limit (33 tokens)
 //   cappedTokens: n                       ... with that many tokens instead
 //   cpuStartFails: n                      the first n starts of the CPU module after a WebGPU start (per worker) fail
@@ -150,7 +151,7 @@ async function loadFakeEngine({ abortRequested, post, options, gpu }) {
         failNext--;
         return { status: -1 };
       }
-      return { status: 0, text: o.text ?? 'dobrý den', ...capInfo, language: o.noLanguage ? '' : String(languages).split(',')[0] };
+      return { status: 0, text: o.emptyTextAt === counters.transcribes ? '' : (o.text ?? 'dobrý den'), ...capInfo, language: o.noLanguage ? '' : String(languages).split(',')[0] };
     },
     wipe() {
       counters.wipes++;

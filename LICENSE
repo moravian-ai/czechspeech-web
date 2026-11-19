@@ -30,9 +30,10 @@ Required Notice: Copyright (c) 2026 Jan Rosecký (Moravian AI) (https://moravian
 
    This software includes whisper.cpp and ggml (MIT licence, Copyright (c) 2023-2026 The ggml authors), the
    Silero VAD v6.2.0 model (MIT licence, Copyright (c) 2020-present Silero Team), Dawn's emdawnwebgpu WebGPU
-   bindings in the WebGPU module (BSD 3-Clause, Copyright The Dawn & Tint Authors) and the Emscripten runtime and
-   system libraries compiled into the WebAssembly modules (MIT/University of Illinois NCSA, MIT, Apache 2.0 with
-   LLVM exceptions, public domain). Their licences, reproduced in THIRD_PARTY_NOTICES, apply to those components
+   bindings in the WebGPU module (BSD 3-Clause, Copyright The Dawn & Tint Authors), ONNX Runtime
+   (onnxruntime-web 1.31.1, MIT licence, Copyright (c) Microsoft Corporation) for speaker recognition, and the
+   Emscripten runtime and system libraries compiled into the WebAssembly modules (MIT/University of Illinois NCSA,
+   MIT, Apache 2.0 with LLVM exceptions, public domain). Their licences, reproduced in THIRD_PARTY_NOTICES, apply to those components
    and are not changed by this licence.
 
 ================================================================================================================

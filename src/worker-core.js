@@ -21,6 +21,7 @@ import { Endpointer, FRAME_MS, FRAME_SAMPLES, SAMPLE_RATE, STOP_TAIL_MAX_FRAMES 
 import { WHISPER_TOKEN_LIMIT, decodingLimits, tokenLimit } from './decoding.js';
 import { describeLoops, removeRepetitionLoops } from './repetition.js';
 import { errorCode } from './events.js';
+import { speechSpan } from './speakers/maths.js';
 
 // Kotlin's Char.isLetterOrDigit: letters (L*) and decimal digits (Nd).
 const LETTER_OR_DIGIT = /[\p{L}\p{Nd}]/u;
@@ -257,6 +258,8 @@ class Capture {
     this.endpointer = null;
     this.audioPort = null;
     this.utterancePort = null;
+    this.speakerPort = null;   // a copy of each utterance's speech goes here (listen({ speakers })), or null
+    this.speakers = false;     // false while the page asked not to compute speakers (the recogniser runs on the CPU...)
     this.tail = -1;          // stop(): frames since it while the word in progress finishes; -1 when not waiting
     this.stopAtFrame = 0;    // stop(): frames processed when it came
     this.drained = false;    // stop(): the wait is over; audio after this is dropped until the end marker
@@ -266,6 +269,7 @@ class Capture {
     switch (msg.type) {
       case 'start': return this.#start(msg);
       case 'drain': return this.#drain();
+      case 'speakers': this.speakers = !!msg.enabled; return undefined;
       case 'stop': return this.#stop();
       // stop() when the end marker could not come on the audio port (see Session.finish in src/speech.js)
       case 'finish': return this.#end();
@@ -312,10 +316,12 @@ class Capture {
     this.post({ type: 'drained' });
   }
 
-  #start({ audioPort, utterancePort }) {
+  #start({ audioPort, utterancePort, speakerPort = null, speakers = false }) {
     this.endpointer = new Endpointer(this.config, (ev) => this.#onEndpointer(ev));
     this.audioPort = audioPort;
     this.utterancePort = utterancePort;
+    this.speakerPort = speakerPort;
+    this.speakers = !!speakerPort && !!speakers;
     audioPort.onmessage = (e) => this.#onAudio(e.data);
   }
 
@@ -369,7 +375,14 @@ class Capture {
       }
       const id = ++this.ids;
       const meta = { id, afterSeq: this.seq, startMs: ev.startMs, endMs: ev.endMs };
-      this.post({ type: 'utterance', ...meta, samples: ev.samples.length });
+      // The speech span only (no trailing silence), as a copy: the recogniser gets `samples` itself, by transfer
+      let speaker = false;
+      if (this.speakerPort && this.speakers) {
+        const copy = speechSpan(ev.samples, ev.audioStartMs, ev.endMs).slice();
+        this.speakerPort.postMessage({ type: 'utterance', id, startMs: ev.startMs, audioStartMs: ev.audioStartMs, endMs: ev.endMs, samples: copy }, [copy.buffer]);
+        speaker = true;
+      }
+      this.post({ type: 'utterance', ...meta, samples: ev.samples.length, speaker });
       this.utterancePort.postMessage({ type: 'utterance', ...meta, samples: ev.samples }, [ev.samples.buffer]);
       this.sent++;
     }
@@ -840,7 +853,7 @@ class Recognizer {
     const t1 = now();
     const gpu = this.engine.async;
     let r;
-    let stopped = false;
+    let stopped;
     // max_tokens relative to the audio length, no temperature fallback (src/decoding.js)
     const limits = decodingLimits(samples.length, this.engineOptions, this.modelSource.tokensPerSecond);
     // 'cs', or 'pl,en': one language is forced, several are chosen among by whisper.cpp

@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Speaker embedding benchmark</title>
+<script type="module">
+// Everything comes from the local test server. Nothing is sent anywhere.
+import { SpeakerEngine } from '/src/speakers/engine.js';
+import { VoiceprintModel } from '/src/speakers/model.js';
+import { STRICT } from '/src/speakers/points.js';
+
+let engine = null;
+let source = null;
+
+function wavSamples(buf) {
+  const dv = new DataView(buf);
+  let pos = 12;
+  while (pos + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(dv.getUint8(pos), dv.getUint8(pos + 1), dv.getUint8(pos + 2), dv.getUint8(pos + 3));
+    const size = dv.getUint32(pos + 4, true);
+    if (id === 'data') {
+      const n = Math.min(size, buf.byteLength - pos - 8) >> 1;
+      const x = new Float32Array(n);
+      for (let i = 0; i < n; i++) x[i] = dv.getInt16(pos + 8 + 2 * i, true) / 32768;
+      return x;
+    }
+    pos += 8 + size + (size & 1);
+  }
+  throw new Error('no data chunk');
+}
+const median = (a) => [...a].sort((p, q) => p - q)[a.length >> 1];
+const audio = (seconds) => {
+  const n = Math.round(seconds * 16000);
+  const x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = source[i % source.length];
+  return x;
+};
+
+window.create = async ({ modelUrl, pins, threads, audioUrl, maxInputMs }) => {
+  source = wavSamples(await (await fetch(audioUrl)).arrayBuffer());
+  const t0 = performance.now();
+  const model = await VoiceprintModel.download({ url: modelUrl, assetBaseUrl: `${location.origin}/src/`, _pins: pins });
+  const t1 = performance.now();
+  engine = await SpeakerEngine.create({ model, threads, point: STRICT, maxInputMs, assetBaseUrl: `${location.origin}/src/` });
+  return { isolated: self.crossOriginIsolated, threads: engine.threads, downloadMs: Math.round(t1 - t0), createMs: Math.round(performance.now() - t1) };
+};
+
+/** Median of `runs` timings after `warmup` unmeasured ones. kind: 'embed' | 'utterance'. */
+window.time = async ({ kind, seconds, runs, warmup }) => {
+  const ms = [];
+  for (let r = -warmup; r < runs; r++) {
+    const x = audio(seconds);
+    const t0 = performance.now();
+    if (kind === 'embed') await engine.embed(x);
+    else await engine.embedUtterance(x);
+    if (r >= 0) ms.push(performance.now() - t0);
+  }
+  return Math.round(median(ms));
+};
+
+/** The page's memory in MB (page, its workers and their WebAssembly memory), or null where the browser cannot tell. */
+window.memoryMB = async () => {
+  if (!self.crossOriginIsolated || typeof performance.measureUserAgentSpecificMemory !== 'function') return null;
+  try {
+    const r = await performance.measureUserAgentSpecificMemory();
+    return Math.round(r.bytes / 1048576);
+  } catch {
+    return null; // e.g. the headless shell: SecurityError
+  }
+};
+
+window.shutdown = async () => { await engine.close(); };
+window.benchReady = true;
+</script>

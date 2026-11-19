@@ -38,7 +38,9 @@ const ceilDiv = (a, b) => Math.floor((a + b - 1) / b);
  * Events passed to `sink`:
  *   { kind: 'speechStarted', atMs }               speech confirmed (minSpeechMs reached); atMs is where it started
  *   { kind: 'speechEnded', atMs, confirmed }      a run ended; confirmed is false for runs too short to report
- *   { kind: 'utterance', samples, startMs, endMs }
+ *   { kind: 'utterance', samples, startMs, endMs, audioStartMs }
+ *                                                 audioStartMs is where `samples` begins (pre-roll included); the first
+ *                                                 (endMs - audioStartMs) ms of `samples` end with the speech, the rest is silence
  */
 export class Endpointer {
   constructor(config, sink) {
@@ -201,7 +203,7 @@ export class Endpointer {
 
   #emitPiece(frames, endMs) {
     const samples = this.audio.slice(0, frames * FRAME_SAMPLES);
-    this.sink({ kind: 'utterance', samples, startMs: this.pieceStartMs, endMs });
+    this.sink({ kind: 'utterance', samples, startMs: this.pieceStartMs, endMs, audioStartMs: this.bufferFirstFrame * FRAME_MS });
   }
 
   #append(frame, prob) {

@@ -5,10 +5,11 @@
 import { GPU_RETRY_DELAYS_MS, GpuRecovery, adapterLabel } from './backend.js';
 import { resolveConfig, threadCount } from './config.js';
 import { STOP_TAIL_MAX_MS } from './endpointer.js';
-import { CzechSpeechError, SpeechEndedEvent, SpeechErrorEvent, SpeechStartedEvent, TranscriptEvent, errorCode } from './events.js';
+import { CzechSpeechError, SpeakersEvent, SpeechEndedEvent, SpeechErrorEvent, SpeechStartedEvent, TranscriptEvent, errorCode } from './events.js';
 import { openMicrophone } from './mic.js';
 import { CzechSpeechModel } from './model.js';
 import { sha256Hex } from './sha256.js';
+import { SpeakerSession } from './speakers/session.js';
 import { CANCEL_SLOTS } from './worker-core.js';
 
 export const VAD_SHA256 = '2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987';
@@ -28,6 +29,9 @@ const NO_SAB_CLOSE_TIMEOUT_MS = 300;
 // no call waits for it without end. The recogniser's own start includes trying WebGPU (its watchdog: 30 s) and then
 // starting the CPU module.
 const STARTUP_TIMEOUT_MS = 60000;
+// stop(): after the last transcript the loop waits at most this long for the speakers of the utterances that have not got
+// theirs yet; what does not come is not delivered and is counted in state.speakers.lost.
+const SPEAKERS_DRAIN_MS = 10000;
 
 function defaultAssets(base) {
   if (base) {
@@ -201,6 +205,8 @@ export class CzechSpeech {
   #closedError = null; // what close() rejects pending work with
   #closing = null;     // the promise of the first close(), which every close() returns
   #session = null;
+  #listenCount = 0;    // listen() calls so far: the first part of every utteranceId ('<listen call>.<n>')
+  #speakerState = null; // state.speakers: of the last listen() with speakers
   #recognizer = null;  // Remote
   #recognizerUsers = 0;
   #inFlight = 0;       // transcribe() requests sent to the recogniser and not answered yet
@@ -310,6 +316,7 @@ export class CzechSpeech {
       peakHeapBytes: this.#stats.peakHeapBytes,
       gpuBytes: this.#stats.gpuBytes,
       peakGpuBytes: this.#stats.peakGpuBytes,
+      speakers: this.#speakerState ? { ...this.#speakerState } : null,
       closed: this.#closed,
     };
   }
@@ -362,14 +369,17 @@ export class CzechSpeech {
     return language;
   }
 
-  async *#run({ signal, audio, stream, language, _source } = {}) {
+  async *#run({ signal, audio, stream, language, speakers, _source } = {}) {
     this.#ensureOpen();
     const languages = this.#languagesFor(language);
+    if (speakers !== undefined && speakers !== null && !(speakers instanceof SpeakerSession)) {
+      throw new TypeError('speakers must be a SpeakerSession (SpeakerSession.create())');
+    }
     if (this.#session) {
       throw new CzechSpeechError('listen() is already being iterated; one session at a time', { code: 'busy' });
     }
     if (signal) signal.throwIfAborted();
-    const session = new Session(this.#hooks(), this.#config);
+    const session = new Session(this.#hooks(), this.#config, { listenId: ++this.#listenCount, speakers: speakers || null });
     this.#session = session;
     const onAbort = () => session.cancel(signal.reason);
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -697,6 +707,7 @@ export class CzechSpeech {
     const requested = this.#config.backend;
     const before = this.#stats.backend;
     this.#stats.backend = m.backend;
+    if (this.#session) this.#session.onBackend(m.backend);
     this.#stats.gpuAdapter = m.gpuAdapter || null;
     this.#stats.backendFallback = m.backendFallback || null;
     if (m.backend !== 'webgpu') this.#stats.gpuBytes = 0;
@@ -750,6 +761,9 @@ export class CzechSpeech {
       newCapture: (onMessage) => this.#newWorker('capture', onMessage),
       openMicrophone: (o) => openMicrophone({ workletUrl: this.#assets.worklet, ...o }),
       onWorkerMessage: this.#options._onWorkerMessage || null,
+      backend: () => this.#stats.backend,
+      speakersDrainMs: () => this.#options._speakersDrainMs ?? SPEAKERS_DRAIN_MS,
+      speakerState: (st) => { this.#speakerState = st; },
     };
   }
 }
@@ -758,7 +772,7 @@ let sessionIds = 0;
 
 /** One listen() session: microphone (or test source) + capture worker + a lease on the recogniser. */
 class Session {
-  constructor(hooks, config) {
+  constructor(hooks, config, { listenId = 0, speakers = null } = {}) {
     this.id = ++sessionIds;
     this.h = hooks;
     this.config = config;
@@ -782,6 +796,15 @@ class Session {
     this.finishing = false;  // stop(): no audio after this, what was captured is still recognised
     this.abandoned = false;  // stop() came before the source was open: it was closed unused
     this.drainTimer = null;  // stop(): set while the capture worker lets the word in progress finish
+    // speakers (listen({ speakers })): one speakers event follows each transcript, whatever order the two arrive in
+    this.listenId = listenId;
+    this.ss = speakers;      // the SpeakerSession, or null
+    this.speakerAttached = false;
+    this.speakerOff = null;  // null, 'cpu' or 'failed': new utterances are not sent to the speaker worker
+    this.utts = new Map();   // utterance id of the capture worker -> what is known of its speakers (only with speakers)
+    this.waiting = new Set(); // ids whose transcript is out and whose speakers event is not
+    this.speakerStats = { unsplit: 0, skipped: 0, lost: 0 };
+    this.speakersDrainTimer = null;
   }
 
   // ---- consumer side ----
@@ -808,6 +831,8 @@ class Session {
     if (this.done || this.error) return;
     this.done = true;
     this.#clearDrain();
+    this.#clearSpeakersDrain();
+    this.#reportSpeakers();
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = null;
@@ -876,7 +901,7 @@ class Session {
 
   async #finishSource() {
     const s = this.source;
-    let delivered = false;
+    let delivered;
     try {
       // the end marker travels on the audio port after the last frame, so no frame is lost
       delivered = typeof s.finish === 'function' ? !!(await s.finish()) : false;
@@ -939,9 +964,12 @@ class Session {
     Promise.all([rec, cap, src]).then(([r, c, s]) => {
       if (this.stopping || this.abandoned) return;
       const channel = new MessageChannel();
-      c.post({ type: 'start', audioPort: s.port, utterancePort: channel.port1 }, [s.port, channel.port1]);
+      const speakerPort = this.#attachSpeakers();
+      const transfer = speakerPort ? [s.port, channel.port1, speakerPort] : [s.port, channel.port1];
+      c.post({ type: 'start', audioPort: s.port, utterancePort: channel.port1, speakerPort, speakers: this.speakerOff === null }, transfer);
       r.post({ type: 'listen', session: this.id, token: this.token, port: channel.port2, languages }, [channel.port2]);
       this.listening = true;
+      this.#reportSpeakers();
       const rate = s.sampleRate ? `, capture at ${s.sampleRate} Hz` : '';
       this.h.log('info', `listen: session started in ${Math.round(performance.now() - t0)} ms${rate}`);
       // stop() during start-up: the audio captured so far is still recognised
@@ -961,6 +989,7 @@ class Session {
         return;
       }
       case 'utterance':
+        if (this.ss) this.#utt(m.id).speaker = !!m.speaker;
         return;
       case 'drained':
         return this.#drained();
@@ -998,12 +1027,142 @@ class Session {
       this.h.log('warn', `utterance failed: ${m.error}`);
       this.#push(new SpeechErrorEvent(new CzechSpeechError(m.error, { code: 'recognition' })));
     } else if (m.text && !m.cancelled) {
-      this.#push(new TranscriptEvent(m.text, m.startMs, m.endMs, m.processingMs, m.language));
+      this.#push(new TranscriptEvent(m.text, m.startMs, m.endMs, m.processingMs, m.language, `${this.listenId}.${m.id}`));
+      this.#afterTranscript(m.id);
+      return;
+    }
+    this.#noTranscript(m.id);
+  }
+
+  // ---- speakers ----
+
+  #utt(n) {
+    let st = this.utts.get(n);
+    if (!st) {
+      st = { speaker: null, transcript: false, none: false, ev: null }; // speaker: did the capture worker send a copy
+      this.utts.set(n, st);
+    }
+    return st;
+  }
+
+  /** The speaker port for the capture worker, or null (no speakers, or their worker is gone: transcripts go on). */
+  #attachSpeakers() {
+    if (!this.ss) return null;
+    this.onBackend(this.h.backend());
+    try {
+      const port = this.ss._attach(this.listenId, (ev, info) => this.#onSpeakers(ev, info), (err) => this.#onSpeakerFailure(err));
+      this.speakerAttached = true;
+      return port;
+    } catch (err) {
+      if (err && err.code === 'closed') throw err; // a closed session is a mistake of the caller
+      this.speakerOff = 'failed';                  // its worker died earlier: no speakers, the transcript goes on
+      return null;
     }
   }
 
+  /** The recogniser's backend (at start and when it changes): on the CPU the app may ask for no speakers (onCpu 'skip'). */
+  onBackend(backend) {
+    if (!this.ss || this.speakerOff === 'failed') return;
+    const off = this.ss.onCpu === 'skip' && backend === 'cpu' ? 'cpu' : null;
+    if (off === this.speakerOff) return;
+    this.speakerOff = off;
+    if (this.listening && this.capture) {
+      try { this.capture.post({ type: 'speakers', enabled: off === null }); } catch { /* the worker is gone */ }
+    }
+    this.#reportSpeakers();
+  }
+
+  /** The speakers of one utterance, from the speaker worker: out at once when its transcript is, else held for it. */
+  #onSpeakers(ev, info) {
+    const n = Number(ev.utteranceId.slice(ev.utteranceId.indexOf('.') + 1));
+    if (info && info.mode === 'whole') this.speakerStats.unsplit++;
+    const st = this.#utt(n);
+    if (st.none) {
+      ev.discard();        // the utterance has no transcript (the speech gate, empty text, an error): it founds no speaker
+      this.utts.delete(n);
+    } else if (st.transcript) {
+      this.#emitSpeakers(n, ev);
+      this.#maybeComplete();
+    } else {
+      st.ev = ev;
+    }
+  }
+
+  #afterTranscript(n) {
+    if (!this.ss) return;
+    const st = this.#utt(n);
+    st.transcript = true;
+    if (st.ev) return this.#emitSpeakers(n, st.ev);
+    // not sent to the speaker worker (cpu, or its worker is gone), or it is gone since: nothing will come
+    let skipped = null;
+    if (st.speaker === false || (st.speaker === null && this.speakerOff !== null)) skipped = this.speakerOff ?? 'failed';
+    else if (this.speakerOff === 'failed') skipped = 'failed';
+    if (skipped) return this.#emitSpeakers(n, new SpeakersEvent(`${this.listenId}.${n}`, [], skipped));
+    this.waiting.add(n);
+    this.#reportSpeakers();
+    return undefined;
+  }
+
+  #noTranscript(n) {
+    if (!this.ss) return;
+    const st = this.#utt(n);
+    if (st.ev || st.speaker === false) {                    // held speakers are dropped (and zeroed); none are coming
+      if (st.ev) st.ev.discard();
+      this.utts.delete(n);
+    }
+    else st.none = true;                                      // they may still arrive: dropped then
+  }
+
+  #emitSpeakers(n, ev) {
+    const out = ev instanceof SpeakersEvent ? ev : ev.commit(); // the pieces are tagged now, in the order of the transcripts
+    this.#push(out);
+    if (out.skipped) this.speakerStats.skipped++;
+    this.utts.delete(n);
+    this.waiting.delete(n);
+    this.#reportSpeakers();
+  }
+
+  /** The speaker worker failed or the SpeakerSession was closed: nothing more comes from it. */
+  #onSpeakerFailure() {
+    if (this.speakerOff === 'failed') return;
+    this.speakerOff = 'failed';
+    if (this.listening && this.capture) {
+      try { this.capture.post({ type: 'speakers', enabled: false }); } catch { /* the worker is gone */ }
+    }
+    for (const n of [...this.waiting]) this.#emitSpeakers(n, new SpeakersEvent(`${this.listenId}.${n}`, [], 'failed'));
+    this.#maybeComplete();
+  }
+
+  #reportSpeakers() {
+    if (!this.ss) return;
+    this.h.speakerState({
+      active: this.speakerAttached && !this.stopping && !this.done && !this.error && this.speakerOff === null,
+      threads: this.ss.threads, pending: this.waiting.size, ...this.speakerStats,
+    });
+  }
+
+  /** stop(): the transcripts are all out; the speakers of the last utterances are waited for, but not for ever. */
+  #startSpeakersDrain() {
+    if (this.speakersDrainTimer !== null) return;
+    this.speakersDrainTimer = setTimeout(() => {
+      this.speakersDrainTimer = null;
+      this.speakerStats.lost += this.waiting.size;
+      this.waiting.clear();
+      this.#finish();
+    }, this.h.speakersDrainMs());
+  }
+
+  #clearSpeakersDrain() {
+    if (this.speakersDrainTimer === null) return;
+    clearTimeout(this.speakersDrainTimer);
+    this.speakersDrainTimer = null;
+  }
+
   #maybeComplete() {
-    if (this.expected !== null && this.results >= this.expected && this.held.length === 0) this.#finish();
+    if (this.expected !== null && this.results >= this.expected && this.held.length === 0) {
+      if (this.waiting.size > 0) this.#startSpeakersDrain();
+      else this.#finish();
+    }
   }
 
   // ---- stop ----
@@ -1038,6 +1197,15 @@ class Session {
       }
       cap.terminate();
     }
+    if (this.speakerAttached) {
+      // the speaker worker drops (and zeroes) what this listen() still had queued there
+      this.speakerAttached = false;
+      try { this.ss._detach(this.listenId); } catch { /* closed */ }
+    }
+    this.#clearSpeakersDrain();
+    for (const st of this.utts.values()) if (st.ev) st.ev.discard(); // never transcribed: nothing to tag
+    this.utts.clear();
+    this.#reportSpeakers();
     if (closing) await closing;
     // 4. The recogniser drops what is queued for this session (it reads the capture worker's last message, 'close',
     //    after every utterance), then the lease is released, which frees the model.

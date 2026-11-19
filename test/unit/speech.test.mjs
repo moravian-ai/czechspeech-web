@@ -3,39 +3,13 @@
 // termination). "Speech" is any frame with a sample above 0.05 in magnitude. No model, no WebAssembly: always runs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import v8 from 'node:v8';
 import { CzechSpeech, CzechSpeechModel, CzechSpeechError } from '../../src/index.js';
-import { ArrayAudioSource, FRAME_SAMPLES, Signals, TestEnv, nodeWorkerFactory, within } from '../support/env.mjs';
+import { fakeEntry, vadModel, setup } from '../support/speech-setup.mjs';
+import { ArrayAudioSource, FRAME_SAMPLES, Signals, nodeWorkerFactory, within } from '../support/env.mjs';
 
-const fakeEntry = new URL('../support/fake-worker-entry.mjs', import.meta.url);
-const vadModel = fs.readFileSync(TestEnv.vadAsset);
 const utterance = Signals.concat(Signals.zeros(0.5), Signals.tone(1.0), Signals.zeros(1.0));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function setup({ engine, config, keep, noSab, modelPath = 'fake-model.bin', abortGraceMs } = {}) {
-  const fake = { capture: null, recognizer: null, events: [] };
-  const logs = [];
-  const factory = nodeWorkerFactory(fakeEntry);
-  const speech = await CzechSpeech.create({
-    model: CzechSpeechModel._fromPath(modelPath, 1000),
-    config,
-    keepModelLoaded: keep,
-    log: (level, message) => logs.push(`${level}: ${message}`),
-    _createWorker: factory,
-    _vadModel: vadModel,
-    _engineOptions: engine,
-    _noSharedMemory: noSab,
-    _abortGraceMs: abortGraceMs,
-    _onWorkerMessage: (role, m) => {
-      if (m.type === 'fake') {
-        fake[role] = m;
-        fake.events.push(`${role}:${m.event}`);
-      }
-    },
-  });
-  return { speech, factory, fake, logs };
-}
 
 async function collect(iterable, onEvent) {
   const events = [];

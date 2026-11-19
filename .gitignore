@@ -19,3 +19,6 @@ test-results/
 *.webm
 *.pcm
 *.part
+
+# Speaker test outputs (reference embeddings are biometric data)
+test/speakers/out/

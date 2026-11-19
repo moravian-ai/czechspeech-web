@@ -36,3 +36,13 @@ describe('static guards: the repository and package.json', () => {
     assert.deepEqual(pkg.devEngines, { runtime: { name: 'node', version: '>=22', onFail: 'error' } });
   });
 });
+
+describe('the CHANGELOG date guard of prepack', () => {
+  test('refuses the placeholder, a missing heading and a date that does not exist; accepts a real date', async () => {
+    const { changelogDateProblem } = await import('../../scripts/changelog-date.mjs');
+    assert.match(changelogDateProblem('# Changelog\n\n## 0.3.0 (YYYY-MM-DD)\n', '0.3.0'), /no real date/);
+    assert.match(changelogDateProblem('## 0.3.0 (2026-02-30)\n', '0.3.0'), /no real date/);
+    assert.match(changelogDateProblem('## 0.2.0 (2026-11-17)\n', '0.3.0'), /no heading/);
+    assert.equal(changelogDateProblem('# Changelog\n\n## 0.3.0 (2026-11-20)\n\n## 0.2.0 (YYYY-MM-DD)\n', '0.3.0'), null);
+  });
+});

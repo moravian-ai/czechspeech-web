@@ -17,7 +17,7 @@ const vadModel = fs.readFileSync(TestEnv.vadAsset);
 const utterance = Signals.concat(Signals.zeros(0.5), Signals.tone(1.0), Signals.zeros(1.0));
 
 test('the documented codes are the ones the package knows', async () => {
-  assert.equal(DOCUMENTED.length, 12);
+  assert.equal(DOCUMENTED.length, 15);
   const { ERROR_CODES } = await import('../../src/events.js');
   assert.deepEqual(ERROR_CODES, DOCUMENTED);
   assert.ok(Object.isFrozen(ERROR_CODES));

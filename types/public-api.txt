@@ -21,7 +21,22 @@ DEFAULT_AUDIO_CONSTRAINTS: object { autoGainControl, channelCount, echoCancellat
 DEFAULT_CONFIG: object { backend, maxUtteranceMs, minSilenceMs, minSpeechMs, negThreshold, preRollMs, threads, threshold }
 DEFAULT_MODEL: object { sha256, size, url }
 DEFAULT_MODEL_ID: string "cs"
+DEFAULT_VOICEPRINT_ID: string "voiceprint-cs"
 MODELS: object { cs }
+SpeakerSession: class
+    static create()
+    _attach()
+    _detach()
+    close()
+    closed { get }
+    onCpu { get }
+    speakers { get }
+    threads { get }
+    toJSON()
+    toString()
+SpeakersEvent: class
+    toJSON()
+    toString()
 SpeechEndedEvent: class
 SpeechErrorEvent: class
 SpeechStartedEvent: class
@@ -29,3 +44,15 @@ TranscriptEvent: class
     toJSON()
     toString()
 VERSION: string
+VOICEPRINT_MODELS: object { voiceprint-cs }
+VoiceprintModel: class
+    static delete()
+    static download()
+    static isDownloaded()
+    _modelBlob()
+    _runtimeBlob()
+    dim { get }
+    id { get }
+    sha256 { get }
+    size { get }
+speakerSupport: function
